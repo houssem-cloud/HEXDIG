@@ -866,12 +866,20 @@ _IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_spike_img"
 def _load_font(size):
     from PIL import ImageFont
     for path in (r"C:\Windows\Fonts\arialbd.ttf", r"C:\Windows\Fonts\segoeuib.ttf",
-                 r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf"):
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                 "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                 r"C:\Windows\Fonts\segoeui.ttf", r"C:\Windows\Fonts\arial.ttf",
+                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"):
         try:
             return ImageFont.truetype(path, size)
         except Exception:
             continue
-    return ImageFont.load_default()
+    try:
+        return ImageFont.load_default(size=size)
+    except Exception:
+        return ImageFont.load_default()
 
 def header_image(pair, signal, closes):
     try:
@@ -880,7 +888,7 @@ def header_image(pair, signal, closes):
         return None
     try:
         os.makedirs(_IMG_DIR, exist_ok=True)
-        W, H = 800, 240
+        W, H = 800, 300
         img = Image.new("RGB", (W, H), (13, 17, 23))
         d = ImageDraw.Draw(img)
         buy = signal == "CALL"
@@ -892,11 +900,14 @@ def header_image(pair, signal, closes):
             rng = (hi - lo) or 1e-12
             n = len(vals)
             pts = [(16 + (W - 32) * k / (n - 1),
-                    H - 24 - (v - lo) / rng * (H * 0.32)) for k, v in enumerate(vals)]
-            d.line(pts, fill=dim, width=5, joint="curve")
-            d.line(pts[-max(2, n // 3):], fill=color, width=5, joint="curve")
-        d.text((24, 12), fmt_pair(pair), fill=(150, 160, 170), font=_load_font(26))
-        d.text((20, 46), "BUY" if buy else "SELL", fill=color, font=_load_font(120))
+                    (H - 26) - (v - lo) / rng * (H * 0.26)) for k, v in enumerate(vals)]
+            d.line(pts, fill=dim, width=6, joint="curve")
+            d.line(pts[-max(2, n // 3):], fill=color, width=6, joint="curve")
+        d.text((24, 14), fmt_pair(pair), fill=(150, 160, 170), font=_load_font(30))
+        word = "BUY" if buy else "SELL"
+        d.text((24, 52), word, fill=color, font=_load_font(160))
+        d.text((40 + _load_font(160).getlength(word), 70),
+               "\u25b2" if buy else "\u25bc", fill=color, font=_load_font(80))
         path = os.path.join(_IMG_DIR, f"hdr_{int(time.time() * 1000)}.png")
         img.save(path)
         return path
