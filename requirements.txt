@@ -2,6 +2,7 @@ pandas
 numpy
 requests
 scikit-learn
+Pillow
 # optional: live Pocket Option payouts via SSID (pocket_payout.py)
 binaryoptionstoolsv2
 # only needed for full auto-clicker:
