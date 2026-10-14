@@ -345,12 +345,178 @@ def analyze(closes, model=None, news_symbol=None):
     sentiment_weight = 0.2
     conf_adjusted = conf_base * (1 + sentiment_weight * news_s) if news_s else conf_base
     regime_factor = 1.0 if out["regime"] == "squeeze" else (1.1 if out["regime"] == "normal" else 0.9)
-    conf_final = min(95.0, max(20.0, conf_adjusted * regime_factor))
+
+    ml_score = _ml_predict(closes)
+    out["ml_score"] = ml_score
+    out["confidence_factors"]["ml"] = ml_score
+
+    ohlc_data = fetch_ohlc(sel_pair_default(), 60) if pocket_payout else None
+    pa_score = _price_action_score(ohlc_data) if ohlc_data else 0.0
+    out["price_action"] = pa_score
+    out["confidence_factors"]["price_action"] = pa_score
+
+    tf_sig, tf_conf = _multi_tf_confluence(sel_pair_default(), 60)
+    out["tf_confluence"] = tf_conf
+    out["confidence_factors"]["tf_confluence"] = tf_conf
+
+    adaptive = _adaptive_confidence(out)
+    out["adaptive_factor"] = adaptive
+    out["confidence_factors"]["adaptive"] = adaptive
+
+    best_mult, best_acc = _backtest_optimize(closes, model)
+    out["optimized_mult"] = best_mult
+    out["optimized_acc"] = best_acc
+    out["confidence_factors"]["backtest_mult"] = best_mult
+
+    conf_final = min(95.0, max(20.0, conf_adjusted * regime_factor * adaptive))
     out["confidence_factors"]["regime"] = out["regime"]
     out["confidence"] = conf_final
     out["signal"] = decide_at(stk, i, params) or "WAIT"
     out["accuracy"] = out["measured"]
     return out
+
+
+# ===== ML & ENHANCEMENT =====
+def _ml_predict(closes):
+    """Random Forest prediction for next-bar direction."""
+    try:
+        from sklearn.ensemble import RandomForestClassifier
+        if len(closes) < 100:
+            return 0.0
+        s = pd.Series([float(x) for x in closes])
+        X, y = [], []
+        for i in range(50, len(s) - HORIZON):
+            feat = [
+                float(s.iloc[i] - s.iloc[i - 5]),
+                float(s.iloc[i] - s.iloc[i - 10]),
+                float(s.rolling(20).mean().iloc[i] - s.iloc[i]),
+                float(s.pct_change().iloc[i] * 1000),
+                float(s.rolling(10).std().iloc[i] / s.iloc[i] * 1000),
+            ]
+            X.append(feat)
+            y.append(1 if s.iloc[i + HORIZON] > s.iloc[i] else 0)
+        clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
+        clf.fit(X[:-10], y[:-10])
+        last = [[
+            float(s.iloc[-1] - s.iloc[-6]),
+            float(s.iloc[-1] - s.iloc[-11]),
+            float(s.rolling(20).mean().iloc[-1] - s.iloc[-1]),
+            float(s.pct_change().iloc[-1] * 1000),
+            float(s.rolling(10).std().iloc[-1] / s.iloc[-1] * 1000),
+        ]]
+        prob = clf.predict_proba(last)[0]
+        return float(prob[1] - prob[0])
+    except Exception:
+        return 0.0
+
+
+def _multi_tf_confluence(pair, period_sec):
+    """Confirm signal across current, 2x, and 3x timeframes."""
+    try:
+        signals = []
+        for mult in (1, 2, 3):
+            closes, _ = get_series(pair, period_sec * mult, fetch=True)
+            if closes and len(closes) >= PERIOD + RSI_PERIOD + 6:
+                stk = _indicator_stack(closes)
+                i = len(stk["s"]) - 1
+                sig = decide_at(stk, i, MODEL_PARAMS.get(CURRENT_MODEL, MODEL_PARAMS["solari"]))
+                if sig:
+                    signals.append(sig)
+        if len(signals) >= 2:
+            calls = signals.count("CALL")
+            puts = signals.count("PUT")
+            if calls >= 2:
+                return "CALL", calls / len(signals)
+            if puts >= 2:
+                return "PUT", puts / len(signals)
+        return None, 0.0
+    except Exception:
+        return None, 0.0
+
+
+def _price_action_score(ohlc):
+    """Candlestick pattern recognition with weighted scores."""
+    if not ohlc or len(ohlc) < 5:
+        return 0.0
+    score = 0.0
+    last = ohlc[-1]
+    body = abs(last["c"] - last["o"])
+    rng = max(last["h"] - last["l"], 1e-12)
+    upper_wick = last["h"] - max(last["o"], last["c"])
+    lower_wick = min(last["o"], last["c"]) - last["l"]
+    if body / rng < 0.1:
+        score += 0.5
+    if lower_wick > 2 * body:
+        score += 1.5
+    if upper_wick > 2 * body:
+        score -= 1.5
+    if len(ohlc) >= 3:
+        trio = [1 if ohlc[-k]["c"] > ohlc[-k]["o"] else -1 for k in (1, 2, 3)]
+        if trio == [1, 1, 1]:
+            score -= 1.0
+        elif trio == [-1, -1, -1]:
+            score += 1.0
+    if len(ohlc) >= 2:
+        prev = ohlc[-2]
+        if prev["c"] < prev["o"] and last["c"] > last["o"] and last["c"] >= prev["o"]:
+            score += 2.0
+        if prev["c"] > prev["o"] and last["c"] < last["o"] and last["c"] <= prev["o"]:
+            score -= 2.0
+    return max(-5.0, min(5.0, score))
+
+
+def _adaptive_confidence(res):
+    """Adjust confidence based on win/loss streak."""
+    try:
+        st = track_load()["settled"][-10:]
+        if not st:
+            return 1.0
+        streak = 0
+        last_win = st[-1].get("win")
+        for s in reversed(st):
+            if s.get("win") == last_win:
+                streak += 1
+            else:
+                break
+        if last_win and streak >= 3:
+            return 1.15
+        if not last_win and streak >= 3:
+            return 0.85
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _backtest_optimize(closes, model):
+    """Auto-tune parameters on recent data."""
+    try:
+        best_acc = 0.0
+        best_mult = STD_MULT
+        for mult in [1.5, 2.0, 2.5]:
+            wins = total = 0
+            s = pd.Series([float(x) for x in closes])
+            sma = s.rolling(PERIOD).mean()
+            std = s.rolling(PERIOD).std()
+            up = sma + mult * std
+            lo = sma - mult * std
+            for i in range(PERIOD + 10, len(s) - HORIZON):
+                if pd.isna(up.iloc[i]) or pd.isna(lo.iloc[i]):
+                    continue
+                c = s.iloc[i]
+                nxt = s.iloc[i + HORIZON]
+                sig = "PUT" if c > up.iloc[i] else ("CALL" if c < lo.iloc[i] else None)
+                if not sig:
+                    continue
+                total += 1
+                if (nxt > c) if sig == "CALL" else (nxt < c):
+                    wins += 1
+            acc = wins / total * 100 if total else 0
+            if acc > best_acc:
+                best_acc = acc
+                best_mult = mult
+        return best_mult, best_acc
+    except Exception:
+        return STD_MULT, 0.0
 
 
 def gate_score(res, model=None):
@@ -363,13 +529,20 @@ def gate_score(res, model=None):
     news_s = res.get("news_sentiment", 0.0)
     social_s = res.get("social_sentiment", 0.0)
     volume_pct = res.get("vol_pct", 50.0)
+    ml_score = res.get("ml_score", 0.0)
+    pa_score = res.get("price_action", 0.0)
+    tf_confluence = res.get("tf_confluence", 0.0)
+    adaptive = res.get("adaptive_factor", 1.0)
     news_adj = news_s * 10
     social_adj = social_s * 5
+    ml_adj = ml_score * 8
+    pa_adj = pa_score * 3
+    tf_adj = tf_confluence * 5
     volume_factor = 1.0 if volume_pct >= 50 else 0.95
     regime = res.get("regime", "normal")
     regime_factor = 1.1 if regime == "squeeze" else 1.0
-    adjusted = base + news_adj + social_adj
-    adjusted = adjusted * volume_factor * regime_factor
+    adjusted = base + news_adj + social_adj + ml_adj + pa_adj + tf_adj
+    adjusted = adjusted * volume_factor * regime_factor * adaptive
     return max(5.0, min(98.0, adjusted))
 
 
