@@ -1265,32 +1265,47 @@ if __name__ == "__main__":
              f"Real live market data. No orders are placed.",
              chat_id=chat, keyboard=kb_menu(), html_on=True)
 
-    def send_model_screen(chat):
-        send(f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>",
-             chat_id=chat, keyboard=kb_model(), html_on=True)
+    def send_model_screen(chat, edit_mid=None):
+        text = f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>"
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_model()}})
+        else:
+            send(text, chat_id=chat, keyboard=kb_model(), html_on=True)
 
-    def send_market_screen(chat):
-        send(f"{screen_head('Market', 2)}\nSelect a market:  <i>{now_hm()}</i>",
-             chat_id=chat, keyboard=kb_market(), html_on=True)
+    def send_market_screen(chat, edit_mid=None):
+        text = f"{screen_head('Market', 2)}\nSelect a market:  <i>{now_hm()}</i>"
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_market()}})
+        else:
+            send(text, chat_id=chat, keyboard=kb_market(), html_on=True)
 
-    def send_pair_screen(chat, page=0):
+    def send_pair_screen(chat, page=0, edit_mid=None):
         pairs = market_pairs(sel_market)
+        text = f"{screen_head('Pair', 3)}\nSelect a currency pair:  <i>{now_hm()}</i>"
         if not pairs:
-            send(f"{screen_head('Pair', 3)}\nNo {sel_market.upper()} currency pairs "
-                 f"are online right now. Try the other market.",
-                 chat_id=chat, keyboard=kb_market(), html_on=True)
-            return
-        pages = max(1, (len(pairs) + 7) // 8)
-        page = max(0, min(page, pages - 1))
-        global last_page
-        last_page = page
-        send(f"{screen_head('Pair', 3)}\nSelect a currency pair:  <i>{now_hm()}</i>",
-             chat_id=chat, keyboard=kb_pairs(page, pairs), html_on=True)
+            text = f"{screen_head('Pair', 3)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
+            keyboard = kb_market()
+        else:
+            pages = max(1, (len(pairs) + 7) // 8)
+            page = max(0, min(page, pages - 1))
+            global last_page
+            last_page = page
+            keyboard = kb_pairs(page, pairs)
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": keyboard}})
+        else:
+            send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
-    def send_time_screen(chat):
-        send(f"{screen_head('Time', 4)}\n"
-             f"Select trading time for {html.escape(fmt_pair(sel_pair))}:",
-             chat_id=chat, keyboard=kb_times(), html_on=True)
+    def send_time_screen(chat, edit_mid=None):
+        text = f"{screen_head('Time', 4)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_times()}})
+        else:
+            send(text, chat_id=chat, keyboard=kb_times(), html_on=True)
 
     def send_result(res, chat, m, conf, closes):
         pair_txt = fmt_pair(sel_pair)
@@ -1372,7 +1387,8 @@ if __name__ == "__main__":
             if data == "ui:menu":
                 send_menu(chat)
             elif data == "ui:model":
-                send_model_screen(chat)
+                mid = cb.get("message", {}).get("message_id")
+                send_model_screen(chat, edit_mid=mid)
             elif data.startswith("mdl:"):
                 key = data.split(":", 1)[1]
                 if key in MODEL_PARAMS:
@@ -1380,26 +1396,32 @@ if __name__ == "__main__":
                     globals()["CURRENT_MODEL"] = key
                     persist()
                     warm_feed(sel_pair, sel_time)
-                    send_market_screen(chat)
+                    mid = cb.get("message", {}).get("message_id")
+                    send_market_screen(chat, edit_mid=mid)
             elif data == "ui:market":
-                send_market_screen(chat)
+                mid = cb.get("message", {}).get("message_id")
+                send_market_screen(chat, edit_mid=mid)
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
                 persist()
-                send_pair_screen(chat, 0)
+                mid = cb.get("message", {}).get("message_id")
+                send_pair_screen(chat, 0, edit_mid=mid)
             elif data.startswith("pg:"):
                 try:
                     page = int(data.split(":")[1])
                 except Exception:
                     page = 0
-                send_pair_screen(chat, page)
+                mid = cb.get("message", {}).get("message_id")
+                send_pair_screen(chat, page, edit_mid=mid)
             elif data.startswith("pr:"):
                 sel_pair = data.split(":", 1)[1]
                 persist()
                 warm_feed(sel_pair, sel_time)
-                send_time_screen(chat)
+                mid = cb.get("message", {}).get("message_id")
+                send_time_screen(chat, edit_mid=mid)
             elif data == "ui:pairback":
-                send_pair_screen(chat, last_page)
+                mid = cb.get("message", {}).get("message_id")
+                send_pair_screen(chat, last_page, edit_mid=mid)
             elif data.startswith("tm:"):
                 try:
                     sel_time = int(data.split(":")[1])
