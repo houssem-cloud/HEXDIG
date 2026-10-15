@@ -1095,41 +1095,6 @@ def sync_account_trades():
         track["settled"] = track["settled"][-200:]
         track_save(track)
 
-
-# ===== one-tap accept: place the trade on the linked account =====
-TRADE_ACCEPT_MAX_AGE = 120.0
-_trade_signals = {}     # sid -> {pair, tf, dir, entry, model, created, used}
-
-
-def _register_trade_signal(pair, tf, direction, entry, model):
-    sid = str(int(time.time() * 1000))
-    _trade_signals[sid] = {"pair": pair, "tf": int(tf), "dir": direction,
-                           "entry": entry, "model": model,
-                           "created": time.time(), "used": False}
-    while len(_trade_signals) > 200:
-        _trade_signals.pop(next(iter(_trade_signals)))
-    return sid
-
-
-def _place_trade_bg(chat, sig, amt):
-    ok, msg = pocket_payout.place_trade(sig["pair"], sig["dir"], amt, sig["tf"])
-    if ok:
-        bal = pocket_payout.account_balance()
-        demo = pocket_payout.account_is_demo()
-        tag = "DEMO" if demo else ("LIVE" if demo is False else "account")
-        bal_s = f"\nBalance: <b>${bal:,.2f}</b>" if bal is not None else ""
-        entry_s = f"{sig['entry']:.5f}" if sig.get("entry") else "n/a"
-        send(f"\u2705 <b>Trade placed</b> ({tag})\n"
-             f"{html.escape(fmt_pair(sig['pair']))} | {sig['dir']} | "
-             f"${amt:g} | {tf_label(sig['tf'])}\n"
-             f"Signal entry: {entry_s}{bal_s}",
-             chat_id=chat, html_on=True)
-        print(f"TRADE {sig['dir']} {sig['pair']} ${amt:g} "
-              f"{tf_label(sig['tf'])} id={msg}")
-    else:
-        send(f"\u274c Trade failed: {html.escape(str(msg))}", chat_id=chat)
-        print(f"TRADE FAILED {sig['pair']}: {msg}")
-
 def sel_pair_default():
     return "EURUSD-OTC"
 
@@ -1538,20 +1503,9 @@ def kb_times():
     rows.append([{"text": "Back", "callback_data": "ui:pairback"}])
     return rows
 
-def kb_signal(sid=None):
-    rows = []
-    if sid and pocket_payout is not None:
-        amt = float(globals().get("trade_amount", 1.0))
-        try:
-            demo = pocket_payout.account_is_demo()
-        except Exception:
-            demo = None
-        tag = "" if demo is None else (" \u00b7 demo" if demo else " \u00b7 LIVE")
-        rows.append([{"text": f"\u2705 Accept trade ${amt:g}{tag}",
-                      "callback_data": f"tr:{sid}"}])
-    rows.append([{"text": "Request another signal", "callback_data": "sig:again"}])
-    rows.append([{"text": "Back to Menu", "callback_data": "ui:menu"}])
-    return rows
+def kb_signal():
+    return [[{"text": "Request another signal", "callback_data": "sig:again"}],
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1703,15 +1657,11 @@ def card_caption(res, m, conf, pair, tf_txt):
 def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     pair = pair or sel_pair
     tf_txt = tf_txt or tf_label(sel_time)
-    sid = _register_trade_signal(
-        pair, int(globals().get("sel_time", 60)), res["signal"],
-        m.get("price"), str(globals().get("sel_model") or "solari"))
-    kb = kb_signal(sid)
     cap = card_caption(res, m, conf, pair, tf_txt)
     path = header_image(pair, res["signal"], closes)
     if path:
         try:
-            mid = send_photo(path, cap, chat_id=chat, keyboard=kb, html_on=True)
+            mid = send_photo(path, cap, chat_id=chat, keyboard=kb_signal(), html_on=True)
         finally:
             try:
                 os.remove(path)
@@ -1723,7 +1673,7 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     dot = "\U0001f7e2" if buy else "\U0001f534"
     send(f"{dot} <b>{'BUY' if buy else 'SELL'}</b> - "
          f"{html.escape(fmt_pair(pair))} | {tf_txt}\n\n{cap}",
-         chat_id=chat, keyboard=kb, html_on=True)
+         chat_id=chat, keyboard=kb_signal(), html_on=True)
     return True
 
 GEN_STEPS = ["Volatility scan", "RSI Analysis", "MACD Status", "Moving Average",
@@ -1744,10 +1694,9 @@ def gen_text(pct, values):
 HELP_TEXT = (
     "/start - Main menu\n"
     "/stop - Stop all signals\n"
-    "/amount N - set Accept trade size\n"
     "Flow: Start -> Select AI Model -> Select a market (Stock/OTC) -> "
     "Select a currency pair -> Select trading time -> signal\n"
-    "Tap 'Accept trade' on a signal card to place it on your linked account."
+    "No orders are placed - signals are display only."
 )
 
 if __name__ == "__main__":
@@ -1757,7 +1706,6 @@ if __name__ == "__main__":
     sel_market = str(S.get("market") or "otc")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
-    trade_amount = float(S.get("trade_amount") or 1.0)
     auto_on = False
     CURRENT_MODEL = sel_model
     update_offset = None
@@ -1801,12 +1749,11 @@ if __name__ == "__main__":
 
     def persist():
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
-                       "model": sel_model, "market": sel_market,
-                       "trade_amount": trade_amount})
+                       "model": sel_model, "market": sel_market})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
-             f"Real live market data. Trades only when you tap Accept.",
+             f"Real live market data. No orders are placed.",
              chat_id=chat, keyboard=kb_menu(), html_on=True)
 
     def send_model_screen(chat, edit_mid=None):
@@ -1923,7 +1870,7 @@ if __name__ == "__main__":
     _processed_cbs = set()
 
     def handle_update(upd):
-        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page, trade_amount
+        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id", "")
@@ -1989,23 +1936,6 @@ if __name__ == "__main__":
                 run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
-            elif data.startswith("tr:"):
-                sid = data.split(":", 1)[1]
-                sig = _trade_signals.get(sid)
-                if not sig or sig.get("used"):
-                    answer(cb_id, "Already traded or expired.")
-                    return
-                if time.time() - sig["created"] > TRADE_ACCEPT_MAX_AGE:
-                    sig["used"] = True
-                    answer(cb_id, "Signal too old to accept.")
-                    return
-                if pocket_payout is None:
-                    answer(cb_id, "Account not linked.")
-                    return
-                sig["used"] = True
-                amt = float(globals().get("trade_amount", 1.0))
-                threading.Thread(target=_place_trade_bg,
-                                 args=(chat, sig, amt), daemon=True).start()
             elif data == "w:stop":
                 stop_watch(chat)
             return
@@ -2033,23 +1963,8 @@ if __name__ == "__main__":
             if watch["on"]:
                 stop_watch(chat)
             send("All signals stopped.", chat_id=chat)
-        elif cmd in ("/amount", "amount"):
-            parts = text.split()
-            try:
-                val = float(parts[1])
-            except Exception:
-                val = 0
-            if val > 0:
-                trade_amount = val
-                persist()
-                send(f"Trade amount set to <b>${trade_amount:g}</b> per Accept.",
-                     chat_id=chat, html_on=True)
-            else:
-                send(f"Current trade amount: <b>${trade_amount:g}</b>\n"
-                     f"Usage: /amount 5", chat_id=chat, html_on=True)
         elif cmd in ("/help", "help"):
-            send("Commands:\n/start - Main menu\n/stop - Stop all signals\n"
-                 "/amount N - set Accept trade size", chat_id=chat)
+            send("Commands:\n/start - Main menu\n/stop - Stop all signals", chat_id=chat)
 
     import queue as _queue
     update_q = _queue.Queue()
