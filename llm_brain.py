@@ -239,6 +239,34 @@ def status():
     }
 
 
+def probe_models():
+    keys = _keys()
+    if not keys:
+        print("No keys configured.")
+        return
+    for p in PROVIDERS:
+        key = keys.get(p["name"])
+        if not key:
+            print(f"{p['name']}: no key configured")
+            continue
+        try:
+            if p["name"] == "groq":
+                r = requests.get("https://api.groq.com/openai/v1/models",
+                                 headers={"Authorization": f"Bearer {key}"}, timeout=20)
+                ids = [m.get("id") for m in r.json().get("data", [])][:10] if r.ok else []
+            elif p["name"] == "gemini":
+                r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                                 params={"key": key}, timeout=20)
+                ids = [m.get("name", "").replace("models/", "") for m in r.json().get("models", [])][:10] if r.ok else []
+            else:
+                r = requests.get("https://openrouter.ai/api/v1/models",
+                                 headers={"Authorization": f"Bearer {key}"}, timeout=20)
+                ids = [m.get("id") for m in r.json().get("data", [])][:10] if r.ok else []
+            print(f"{p['name']} ({r.status_code}):", ids)
+        except Exception as e:
+            print(f"{p['name']}: error {e}")
+
+
 if __name__ == "__main__":
     import sys
     args = sys.argv[1:]
@@ -249,6 +277,8 @@ if __name__ == "__main__":
         cfg = _load_cfg()
         cfg[f"{args[1]}_model"] = str(args[2]).strip()
         print("saved." if _save_cfg(cfg) else "FAILED.")
+    elif args and args[0] == "--probe-models":
+        probe_models()
     elif args and args[0] == "--status":
         print(json.dumps(status(), indent=2))
     elif args and args[0] == "--test":
@@ -266,4 +296,4 @@ if __name__ == "__main__":
               "no provider answered (check keys / free quota)")
     else:
         print("Use: --set-key <groq|gemini|openrouter> <key> | "
-              "--set-model <provider> <model> | --status | --test")
+              "--set-model <provider> <model> | --probe-models | --status | --test")
