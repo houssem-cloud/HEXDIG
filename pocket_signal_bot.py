@@ -26,6 +26,7 @@ import json
 import os
 import html
 import threading
+import random
 import requests
 import datetime
 import pandas as pd
@@ -1031,6 +1032,67 @@ def edge_perf(model, regime):
     return w, l, (w / n * 100.0) if n else None, n
 
 
+# ===== Thompson bandit: pick the best model per regime =====
+BANDIT_ENABLED = True
+BANDIT_MIN_SAMPLES = 5
+BANDIT_DECAY_EVERY = 100
+BANDIT_DECAY_FACTOR = 0.6
+
+
+def bandit_sample(model, regime):
+    """Thompson sample from Beta(wins+1, losses+1) for a model/regime arm."""
+    if not model:
+        return 0.5
+    w, l, pct, n = edge_perf(model, regime)
+    if n < BANDIT_MIN_SAMPLES:
+        return random.betavariate(1, 1)
+    return random.betavariate(w + 1, l + 1)
+
+
+def bandit_decay(d):
+    n_total = int(d.get("_n_total", 0))
+    if n_total and n_total % BANDIT_DECAY_EVERY == 0:
+        for key, rec in list(d.items()):
+            if key.startswith("_") or not isinstance(rec, dict):
+                continue
+            rec["w"] = max(1, int(rec.get("w", 0) * BANDIT_DECAY_FACTOR))
+            rec["l"] = max(1, int(rec.get("l", 0) * BANDIT_DECAY_FACTOR))
+
+
+def _edge_record(model, regime, win):
+    if not model:
+        return
+    d = _edge_load()
+    d["_n_total"] = int(d.get("_n_total", 0)) + 1
+    bandit_decay(d)
+    key = _edge_key(model, regime)
+    rec = d.get(key, {"w": 0, "l": 0})
+    if win:
+        rec["w"] = int(rec.get("w", 0)) + 1
+    else:
+        rec["l"] = int(rec.get("l", 0)) + 1
+    d[key] = rec
+    _edge_save(d)
+
+
+def bandit_select(candidates):
+    """candidates: list of (model_key, res_dict). Thompson-sample each arm's
+    historical win-rate in its regime; return the model with the highest sample."""
+    if not candidates:
+        return None, None
+    if not BANDIT_ENABLED or len(candidates) == 1:
+        return candidates[0]
+    best = None
+    best_s = -1.0
+    for m, r in candidates:
+        reg = r.get("regime", "normal")
+        s = bandit_sample(m, reg)
+        if s > best_s:
+            best_s = s
+            best = (m, r)
+    return best
+
+
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
 ACCT_SYNC_GAP = 45.0
 
@@ -1771,6 +1833,7 @@ if __name__ == "__main__":
     sel_market = str(S.get("market") or "otc")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
+    bandit_enabled = bool(S.get("bandit", True))
     auto_on = False
     CURRENT_MODEL = sel_model
     update_offset = None
@@ -1814,7 +1877,8 @@ if __name__ == "__main__":
 
     def persist():
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
-                       "model": sel_model, "market": sel_market})
+                       "model": sel_model, "market": sel_market,
+                       "bandit": bandit_enabled})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
@@ -1901,7 +1965,29 @@ if __name__ == "__main__":
         if pocket_payout is not None and DATA_SRC != "live stream":
             if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
                 closes, note = get_series(sel_pair, sel_time, fetch=True)
-        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+        res = None
+        if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
+            try:
+                ml_train(sel_pair, closes, keys=MODELS, force=False)
+            except Exception:
+                pass
+            candidates = []
+            for m in MODELS:
+                try:
+                    r = analyze(closes, m, news_symbol=sel_pair.replace("-OTC", ""))
+                    if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
+                        candidates.append((m, r))
+                except Exception:
+                    continue
+            if candidates:
+                bm, br = bandit_select(candidates)
+                if bm:
+                    sel_model = bm
+                    globals()["CURRENT_MODEL"] = bm
+                    res = br
+                    res["bandit_model"] = bm
+        if res is None:
+            res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
         res["demo"] = bool(note)
         ohlc = fetch_ohlc(sel_pair, sel_time)
         m = tech_metrics(closes, ohlc, res)
@@ -1935,7 +2021,7 @@ if __name__ == "__main__":
     _processed_cbs = set()
 
     def handle_update(upd):
-        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
+        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page, bandit_enabled
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id", "")
@@ -2029,7 +2115,12 @@ if __name__ == "__main__":
                 stop_watch(chat)
             send("All signals stopped.", chat_id=chat)
         elif cmd in ("/help", "help"):
-            send("Commands:\n/start - Main menu\n/stop - Stop all signals", chat_id=chat)
+            send("Commands:\n/start - Main menu\n/stop - Stop all signals\n"
+                 "/bandit - toggle model bandit on/off", chat_id=chat)
+        elif cmd in ("/bandit", "bandit"):
+            bandit_enabled = not bandit_enabled
+            persist()
+            send(f"Model bandit: <b>{'ON' if bandit_enabled else 'OFF'}</b>", chat_id=chat, html_on=True)
 
     import queue as _queue
     update_q = _queue.Queue()
@@ -2094,14 +2185,31 @@ if __name__ == "__main__":
             closes, note = get_series(sel_pair, sel_time, fetch=True)
             if note or not closes:
                 continue
-            res = analyze(closes, sel_model)
+            res = None
+            if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
+                candidates = []
+                for m in MODELS:
+                    try:
+                        r = analyze(closes, m)
+                        if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
+                            candidates.append((m, r))
+                    except Exception:
+                        continue
+                if candidates:
+                    bm, br = bandit_select(candidates)
+                    if bm:
+                        sel_model = bm
+                        res = br
+                        res["bandit_model"] = bm
+            if res is None:
+                res = analyze(closes, sel_model)
             if res["signal"] in ("CALL", "PUT") and res.get("setup"):
                 key = f"{sel_pair}#{sel_time}#{sel_model}"
                 if time.time() - last_state.get(key, 0) >= COOLDOWN_SEC:
                     last_state[key] = time.time()
                     ohlc = fetch_ohlc(sel_pair, sel_time)
                     m = tech_metrics(closes, ohlc, res)
-                    send_card(owner_id, res, m, gate_score(res), closes)
+                    send_card(owner_id, res, m, gate_score(res, sel_model), closes)
                     track_add(sel_pair, sel_time, res["signal"], m.get("price"),
                               sel_model, res.get("regime"),
                               features=_feat_last(closes))
