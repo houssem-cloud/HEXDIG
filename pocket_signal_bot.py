@@ -1440,7 +1440,7 @@ def answer(cb_id, text=None):
 def get_updates(offset=None):
     try:
         r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                         params={"offset": offset, "timeout": 0}, timeout=15)
+                         params={"offset": offset, "timeout": 30}, timeout=40)
         return r.json().get("result", [])
     except Exception as e:
         print("getUpdates failed:", e)
@@ -2004,7 +2004,6 @@ if __name__ == "__main__":
                     return
                 sig["used"] = True
                 amt = float(globals().get("trade_amount", 1.0))
-                answer(cb_id, f"Placing {sig['dir']} ${amt:g}...")
                 threading.Thread(target=_place_trade_bg,
                                  args=(chat, sig, amt), daemon=True).start()
             elif data == "w:stop":
@@ -2052,13 +2051,30 @@ if __name__ == "__main__":
             send("Commands:\n/start - Main menu\n/stop - Stop all signals\n"
                  "/amount N - set Accept trade size", chat_id=chat)
 
+    import queue as _queue
+    update_q = _queue.Queue()
+
+    def _poll_worker():
+        global update_offset
+        while True:
+            try:
+                updates = get_updates(update_offset)
+            except Exception:
+                updates = []
+            for upd in updates:
+                update_offset = upd["update_id"] + 1
+                update_q.put(upd)
+            if not updates:
+                time.sleep(0.2)
+
+    threading.Thread(target=_poll_worker, daemon=True).start()
+
     while True:
-        try:
-            updates = get_updates(update_offset)
-        except Exception:
-            updates = []
-        for upd in updates:
-            update_offset = upd["update_id"] + 1
+        while True:
+            try:
+                upd = update_q.get_nowait()
+            except _queue.Empty:
+                break
             try:
                 handle_update(upd)
             except Exception:
@@ -2123,4 +2139,4 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        time.sleep(5)
+        time.sleep(1)
