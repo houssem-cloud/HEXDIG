@@ -26,14 +26,25 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llm_state
 PROVIDERS = [
     {"name": "groq", "env": "LLM_GROQ_KEY",
      "url": "https://api.groq.com/openai/v1/chat/completions",
-     "model": "llama-3.3-70b-versatile", "daily_cap": 50},
+     "models": ["llama-3.3-70b-versatile",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                "moonshotai/kimi-k2-instruct",
+                "qwen/qwen3-32b",
+                "openai/gpt-oss-120b"],
+     "daily_cap": 50},
     {"name": "gemini", "env": "LLM_GEMINI_KEY",
      "url": ("https://generativelanguage.googleapis.com/v1beta/models/"
-             "gemini-2.0-flash:generateContent"),
-     "model": "gemini-2.0-flash", "daily_cap": 100},
+             ":generateContent"),
+     "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite",
+                "gemini-flash-latest", "gemini-2.0-flash"],
+     "daily_cap": 100},
     {"name": "openrouter", "env": "LLM_OPENROUTER_KEY",
      "url": "https://openrouter.ai/api/v1/chat/completions",
-     "model": "meta-llama/llama-3.3-70b-instruct:free", "daily_cap": 25},
+     "models": ["meta-llama/llama-3.3-70b-instruct:free",
+                "deepseek/deepseek-chat-v3-0324:free",
+                "qwen/qwen3-235b-a22b:free",
+                "mistralai/mistral-small-3.2-24b-instruct:free"],
+     "daily_cap": 25},
 ]
 
 DAILY_BUDGET = 100
@@ -159,9 +170,9 @@ def _call_openai_style(url, key, model, prompt, timeout):
     return data["choices"][0]["message"]["content"]
 
 
-def _call_gemini(url, key, prompt, timeout):
+def _call_gemini(url, key, model, prompt, timeout):
     r = requests.post(
-        f"{url}?key={key}",
+        f"{url.replace(':generateContent', model + ':generateContent')}?key={key}",
         json={"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
               "contents": [{"role": "user", "parts": [{"text": prompt}]}],
               "generationConfig": {"temperature": 0.2, "maxOutputTokens": 200}},
@@ -181,6 +192,7 @@ def analyze(ctx):
     if st.get("total", 0) >= DAILY_BUDGET:
         return None
     prompt = _build_prompt(ctx)
+    cfg = _load_cfg()
     for p in PROVIDERS:
         key = keys.get(p["name"])
         if not key:
@@ -191,24 +203,27 @@ def analyze(ctx):
         last = float(st["last_call"].get(p["name"], 0))
         if time.time() - last < MIN_GAP_SEC:
             continue
-        try:
-            if p["name"] == "gemini":
-                text = _call_gemini(p["url"], key, prompt, 25)
-            else:
-                text = _call_openai_style(p["url"], key, p["model"], prompt, 25)
-            parsed = _parse_json(text)
-            if not parsed:
+        custom = str(cfg.get(f"{p['name']}_model") or "").strip()
+        models = ([custom] if custom else []) + list(p.get("models") or [])
+        for model in models:
+            try:
+                if p["name"] == "gemini":
+                    text = _call_gemini(p["url"], key, model, prompt, 25)
+                else:
+                    text = _call_openai_style(p["url"], key, model, prompt, 25)
+                parsed = _parse_json(text)
+                if not parsed:
+                    continue
+                parsed["provider"] = p["name"]
+                parsed["model"] = model
+                st["by_provider"][p["name"]] = used + 1
+                st["last_call"][p["name"]] = time.time()
+                st["total"] = int(st.get("total", 0)) + 1
+                _state_save(st)
+                return parsed
+            except Exception as e:
+                print(f"LLM {p['name']} ({model}) failed: {e}")
                 continue
-            parsed["provider"] = p["name"]
-            parsed["model"] = p["model"]
-            st["by_provider"][p["name"]] = used + 1
-            st["last_call"][p["name"]] = time.time()
-            st["total"] = int(st.get("total", 0)) + 1
-            _state_save(st)
-            return parsed
-        except Exception as e:
-            print(f"LLM {p['name']} failed: {e}")
-            continue
     return None
 
 
@@ -230,6 +245,10 @@ if __name__ == "__main__":
     if len(args) >= 3 and args[0] == "--set-key":
         ok = set_key(args[1], args[2])
         print("saved." if ok else "FAILED.")
+    elif len(args) >= 3 and args[0] == "--set-model":
+        cfg = _load_cfg()
+        cfg[f"{args[1]}_model"] = str(args[2]).strip()
+        print("saved." if _save_cfg(cfg) else "FAILED.")
     elif args and args[0] == "--status":
         print(json.dumps(status(), indent=2))
     elif args and args[0] == "--test":
@@ -246,4 +265,5 @@ if __name__ == "__main__":
         print("RESULT:", json.dumps(r, indent=2) if r else
               "no provider answered (check keys / free quota)")
     else:
-        print("Use: --set-key <groq|gemini|openrouter> <key> | --status | --test")
+        print("Use: --set-key <groq|gemini|openrouter> <key> | "
+              "--set-model <provider> <model> | --status | --test")
