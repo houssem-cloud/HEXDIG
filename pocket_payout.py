@@ -418,6 +418,50 @@ def asset_catalog():
     return list(out)
 
 
+def account_trades(max_tries=5):
+    """Recent closed deals from the linked account (read-only). Never raises.
+    Returns [{id, asset, entry, exit, profit, win, refund, demo, open_ts, close_ts, tf}]."""
+    api = _ensure_client()
+    if api is None:
+        return []
+    deals = {}
+    for _ in range(max_tries):
+        try:
+            deals = api.closed_deals() or {}
+        except Exception:
+            deals = {}
+        if deals:
+            break
+        time.sleep(1.0)
+    out = []
+    items = deals.items() if isinstance(deals, dict) else list(enumerate(deals))
+    for did, d in items:
+        try:
+            if not isinstance(d, dict):
+                continue
+            entry = float(d.get("openPrice") or 0)
+            exit_ = float(d.get("closePrice") or 0)
+            profit = float(d.get("profit") or 0)
+            ots = int(d.get("openTimestamp") or 0)
+            cts = int(d.get("closeTimestamp") or 0)
+            out.append({
+                "id": str(d.get("id") or did),
+                "asset": _norm(d.get("asset")),
+                "entry": entry, "exit": exit_,
+                "profit": profit,
+                "win": profit > 0,
+                "refund": profit == 0,
+                "demo": bool(d.get("isDemo")),
+                "open_ts": ots,
+                "close_ts": cts,
+                "tf": max(5, (cts - ots)) if cts > ots else 60,
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda x: x["open_ts"])
+    return out
+
+
 def reset_all():
     stop_live()
     with _LOCK:

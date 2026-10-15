@@ -933,6 +933,131 @@ def track_text():
         return "building (0 signals settled yet)"
     return f"{w}W / {l}L \u00b7 {pct:.0f}% (last {n})"
 
+
+# ===== real account sync (linked via pocket_ssid.json, read-only) =====
+ACCT_SYNC_GAP = 45.0
+
+
+def _acct_raw(asset, open_ts):
+    """Candles covering a past timestamp with >=80 bars of pre-history."""
+    try:
+        if pocket_payout is None:
+            return []
+        api = pocket_payout._ensure_client()
+        if api is None:
+            return []
+        sym = pocket_payout.feed_symbol(pocket_payout._norm(asset))
+        for period in (60, 300, 900, 1800):
+            try:
+                raw = api.get_candles(sym, period, 144) or []
+            except Exception:
+                raw = []
+            if not raw:
+                continue
+            try:
+                oldest = int(raw[0].get("time") or 0)
+            except Exception:
+                return raw
+            bars_before = (open_ts - oldest) / float(period)
+            if bars_before >= 80 or period == 1800:
+                return raw
+        return []
+    except Exception:
+        return []
+
+
+def _feat_from_candles(raw, open_ts):
+    """16-feature snapshot at (or just after) a past timestamp, from real candles."""
+    try:
+        closes, cut = [], None
+        for row in raw:
+            try:
+                closes.append(float(row["close"]))
+            except Exception:
+                continue
+            ts = int(row.get("time") or 0)
+            if cut is None and ts and ts >= open_ts:
+                cut = len(closes) - 1
+        if cut is None:
+            cut = len(closes) - 1
+        if cut < 70:
+            return None
+        return _feat_last(closes[:cut + 1])
+    except Exception:
+        return None
+
+
+def account_perf(last=50):
+    """Win rate from real linked-account trades."""
+    try:
+        st = [x for x in track_load()["settled"]
+              if x.get("source") == "account"][-last:]
+        if not st:
+            return 0, 0, None, 0
+        w = sum(1 for x in st if x.get("win"))
+        return w, len(st) - w, w / len(st) * 100.0, len(st)
+    except Exception:
+        return 0, 0, None, 0
+
+
+def sync_account_trades():
+    """Pull real closed trades from Pocket Option and learn from them."""
+    if pocket_payout is None:
+        return
+    try:
+        trades = pocket_payout.account_trades()
+    except Exception:
+        return
+    if not trades:
+        return
+    try:
+        d = _ml_data_load()
+    except Exception:
+        return
+    seen = set(str(x) for x in (d.get("seen_deals") or []))
+    track = track_load()
+    new_seen = []
+    changed = False
+    new_ts = {}
+    for t in trades:
+        tid = str(t["id"])
+        if tid in seen:
+            continue
+        new_seen.append(tid)
+        if not t.get("refund") and t.get("entry"):
+            a = t["asset"]
+            new_ts[a] = min(new_ts.get(a, 10 ** 12), t["open_ts"])
+    raw_cache = {a: _acct_raw(a, ts0) for a, ts0 in new_ts.items()}
+    for t in trades:
+        tid = str(t["id"])
+        if tid not in new_seen:
+            continue
+        changed = True
+        if t.get("refund") or not t.get("entry"):
+            continue
+        went_up = t["exit"] > t["entry"]
+        if t["win"]:
+            direction = "CALL" if went_up else "PUT"
+        else:
+            direction = "PUT" if went_up else "CALL"
+        feats = _feat_from_candles(raw_cache.get(t["asset"]) or [], t["open_ts"])
+        _ml_learn(t["asset"], feats, direction, bool(t["win"]))
+        track["settled"].append({
+            "pair": t["asset"], "tf": t["tf"], "dir": direction,
+            "entry": t["entry"], "exit": t["exit"], "win": bool(t["win"]),
+            "model": None, "regime": "account", "source": "account",
+            "closed": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        tag = "demo" if t.get("demo") else "real"
+        print(f"Account {t['asset']} {direction} -> "
+              f"{'WIN' if t['win'] else 'LOSS'} ({tag}, profit {t['profit']})")
+    if changed:
+        seen.update(new_seen)
+        d["seen_deals"] = sorted(seen)[-500:]
+        _ml_data_save(d)
+        track["settled"] = track["settled"][-200:]
+        track_save(track)
+
 def sel_pair_default():
     return "EURUSD-OTC"
 
@@ -1454,12 +1579,17 @@ def card_caption(res, m, conf, pair, tf_txt):
         learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
     learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)}: "
                   f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
-    win_line = ""
+    win_lines = []
+    aw, al, apct, an = account_perf()
+    if an >= 1:
+        win_lines.append(f"\U0001f3c6 Account: <b>{aw}W / {al}L</b> "
+                         f"(<b>{apct:.0f}%</b> win \u00b7 real trades)")
     lpct, ln = model_perf(mkey)
     if ln >= 1:
         w = int(round(lpct / 100.0 * ln))
-        win_line = (f"\U0001f3c6 Win / Loss: <b>{w}W / {ln - w}L</b> "
-                    f"(<b>{lpct:.0f}%</b> win rate \u00b7 last {ln} signals)\n\n")
+        win_lines.append(f"\U0001f4c8 Signals: <b>{w}W / {ln - w}L</b> "
+                         f"(<b>{lpct:.0f}%</b> \u00b7 last {ln})")
+    win_line = ("\n".join(win_lines) + "\n\n") if win_lines else ""
     return (
         f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
         f"\U0001fab6 Market info:\n"
@@ -1542,6 +1672,7 @@ if __name__ == "__main__":
     owner_id = None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)
     last_state = {}
     auto_tick = 0.0
+    acct_tick = 0.0
     last_page = 0
     warm_feed(sel_pair, sel_time, wait=20.0)
     _ml_load()
@@ -1853,6 +1984,13 @@ if __name__ == "__main__":
                               sel_model, res.get("regime"),
                               features=_feat_last(closes))
                     print(f"Auto {res['signal']} {sel_pair} {tf_label(sel_time)}")
+
+        if time.time() - acct_tick >= ACCT_SYNC_GAP:
+            acct_tick = time.time()
+            try:
+                sync_account_trades()
+            except Exception as e:
+                print("account sync failed:", e)
 
         try:
             track_settle()
