@@ -462,6 +462,50 @@ def account_trades(max_tries=5):
     return out
 
 
+def place_trade(asset, direction, amount, tf):
+    """Place a CALL/PUT on the linked account. READ-WRITE - real money on live
+    accounts. Never raises. Returns (ok, message)."""
+    api = _ensure_client()
+    if api is None:
+        return False, "Account not linked (save SSID first)."
+    sym = feed_symbol(_norm(asset))
+    try:
+        amt = float(amount)
+        secs = int(tf)
+    except Exception:
+        return False, "Invalid amount or timeframe."
+    if amt <= 0 or secs <= 0:
+        return False, "Invalid amount or timeframe."
+    try:
+        if str(direction).upper() == "CALL":
+            tid, details = api.buy(sym, amt, secs)
+        else:
+            tid, details = api.sell(sym, amt, secs)
+        return True, str(tid)
+    except Exception as e:
+        return False, str(e)
+
+
+def account_balance():
+    api = _ensure_client()
+    if api is None:
+        return None
+    try:
+        return float(api.balance())
+    except Exception:
+        return None
+
+
+def account_is_demo():
+    api = _ensure_client()
+    if api is None:
+        return None
+    try:
+        return bool(api.is_demo())
+    except Exception:
+        return None
+
+
 def reset_all():
     stop_live()
     with _LOCK:
