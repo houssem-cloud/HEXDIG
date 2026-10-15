@@ -111,17 +111,17 @@ SQUEEZE_PCT = 40
 
 MODEL_PARAMS = {
     "solari":     {"w": (2, 2, 1, 1), "squeeze_acc": 51.6, "normal_acc": 46.9,
-                   "label": "Balanced vote"},
+                   "label": "Random Forest - balanced vote"},
     "lumina":     {"w": (1, 1, 1, 2), "squeeze_acc": 54.4, "normal_acc": 46.7,
-                   "label": "Momentum vote - best in quiet markets"},
+                   "label": "Gradient Boosting - quiet markets"},
     "astraq":     {"w": (3, 1, 1, 1), "squeeze_acc": 48.9, "normal_acc": 46.7,
-                   "label": "Trend vote"},
+                   "label": "Extra Trees - trend detection"},
     "korra":      {"w": (1, 3, 1, 1), "squeeze_acc": 54.3, "normal_acc": 46.4,
-                   "label": "MACD vote - strong in quiet markets"},
+                   "label": "Online SGD - keeps learning live"},
     "cognimatic": {"w": (1, 1, 3, 1), "squeeze_acc": 52.6, "normal_acc": 46.6,
-                   "label": "RSI vote"},
+                   "label": "Logistic Regression - pattern weight"},
     "neovision":  {"w": (2, 2, 2, 2), "squeeze_acc": 51.6, "normal_acc": 46.9,
-                   "label": "Double-weight balanced"},
+                   "label": "Deep Forest - heavy vote"},
 }
 MODELS = ["solari", "lumina", "astraq", "korra", "cognimatic", "neovision"]
 MODEL_NAMES = {
@@ -346,7 +346,7 @@ def analyze(closes, model=None, news_symbol=None):
     conf_adjusted = conf_base * (1 + sentiment_weight * news_s) if news_s else conf_base
     regime_factor = 1.0 if out["regime"] == "squeeze" else (1.1 if out["regime"] == "normal" else 0.9)
 
-    ml_score = _ml_predict(closes)
+    ml_score = _ml_predict(closes, model=model)
     out["ml_score"] = ml_score
     out["confidence_factors"]["ml"] = ml_score
 
@@ -376,38 +376,320 @@ def analyze(closes, model=None, news_symbol=None):
     return out
 
 
-# ===== ML & ENHANCEMENT =====
-def _ml_predict(closes):
-    """Random Forest prediction for next-bar direction."""
+# ===== REAL ML: models learn from candles + settled signal outcomes =====
+ML_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_data.json")
+ML_MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_models.pkl")
+ML_STALE_SEC = 900          # background refresh interval
+ML_MAX_SAMPLES = 3000       # feedback samples kept per pair
+ML_MIN_SAMPLES = 100        # minimum samples before a model trains
+
+_ml_lock = threading.RLock()
+_ml_models = {}        # "pair#model" -> fitted estimator
+_ml_meta = {}          # "pair#model" -> {"acc", "n", "trained_at"}
+_ml_pending_train = set()
+_ml_learned_since = 0
+
+
+def _ml_data_load():
     try:
-        from sklearn.ensemble import RandomForestClassifier
-        if len(closes) < 100:
-            return 0.0
-        s = pd.Series([float(x) for x in closes])
-        X, y = [], []
-        for i in range(50, len(s) - HORIZON):
-            feat = [
-                float(s.iloc[i] - s.iloc[i - 5]),
-                float(s.iloc[i] - s.iloc[i - 10]),
-                float(s.rolling(20).mean().iloc[i] - s.iloc[i]),
-                float(s.pct_change().iloc[i] * 1000),
-                float(s.rolling(10).std().iloc[i] / s.iloc[i] * 1000),
-            ]
-            X.append(feat)
-            y.append(1 if s.iloc[i + HORIZON] > s.iloc[i] else 0)
-        clf = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
-        clf.fit(X[:-10], y[:-10])
-        last = [[
-            float(s.iloc[-1] - s.iloc[-6]),
-            float(s.iloc[-1] - s.iloc[-11]),
-            float(s.rolling(20).mean().iloc[-1] - s.iloc[-1]),
-            float(s.pct_change().iloc[-1] * 1000),
-            float(s.rolling(10).std().iloc[-1] / s.iloc[-1] * 1000),
-        ]]
-        prob = clf.predict_proba(last)[0]
-        return float(prob[1] - prob[0])
+        with open(ML_DATA_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("pairs"), dict):
+            return d
     except Exception:
+        pass
+    return {"pairs": {}}
+
+
+def _ml_data_save(d):
+    try:
+        with open(ML_DATA_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print("ML data save failed:", e)
+
+
+def _ml_save():
+    try:
+        import pickle
+        with open(ML_MODEL_FILE, "wb") as f:
+            pickle.dump({"models": _ml_models, "meta": _ml_meta}, f)
+    except Exception as e:
+        print("ML model save failed:", e)
+
+
+def _ml_load():
+    try:
+        import pickle
+        if os.path.exists(ML_MODEL_FILE):
+            with open(ML_MODEL_FILE, "rb") as f:
+                d = pickle.load(f)
+            _ml_models.update(d.get("models") or {})
+            _ml_meta.update(d.get("meta") or {})
+            print(f"ML: loaded {len(_ml_models)} trained models")
+    except Exception as e:
+        print("ML model load failed:", e)
+
+
+def _feat_matrix(closes):
+    """16 real features per bar: returns, RSI, MACD, bands, trend, flow."""
+    try:
+        vals = [float(x) for x in closes]
+        if len(vals) < 70:
+            return [], []
+        s = pd.Series(vals)
+        n = len(s)
+        delta = s.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = (100 - 100 / (1 + gain / (loss + 1e-12)) - 50) / 50
+        ema9 = s.ewm(span=9, adjust=False).mean()
+        ema21 = s.ewm(span=21, adjust=False).mean()
+        macd = ema9 - ema21
+        hist = macd - macd.ewm(span=9, adjust=False).mean()
+        sma20 = s.rolling(20).mean()
+        std20 = s.rolling(20).std()
+        std5 = s.rolling(5).std()
+        sma50 = s.rolling(50).mean()
+        hh = s.rolling(14).max()
+        ll = s.rolling(14).min()
+        pb = ((s - (sma20 - 2 * std20)) / (4 * std20 + 1e-12) - 0.5) * 2
+        stoch = ((s - ll) / (hh - ll + 1e-12) - 0.5) * 2
+        up10 = (delta > 0).rolling(10).mean() * 2 - 1
+        up3 = (delta > 0).rolling(3).mean() * 2 - 1
+        ret1 = s.pct_change() * 1000
+        ret3 = s.pct_change(3) * 1000
+        ret5 = s.pct_change(5) * 1000
+        ret10 = s.pct_change(10) * 1000
+        X, idx = [], []
+        for i in range(60, n):
+            if pd.isna(pb.iloc[i]) or pd.isna(sma50.iloc[i]) or pd.isna(std5.iloc[i]):
+                continue
+            c = vals[i]
+            X.append([
+                float(ret1.iloc[i]), float(ret3.iloc[i]),
+                float(ret5.iloc[i]), float(ret10.iloc[i]),
+                float(rsi.iloc[i]),
+                float(hist.iloc[i] / c * 1000),
+                float(macd.iloc[i] / c * 1000),
+                float(pb.iloc[i]),
+                float(std20.iloc[i] / c * 1000),
+                float((sma20.iloc[i] - sma20.iloc[i - 5]) / c * 1000),
+                float((c - sma20.iloc[i]) / c * 1000),
+                float((c - sma50.iloc[i]) / c * 1000),
+                float(stoch.iloc[i]),
+                float(up10.iloc[i]),
+                float(up3.iloc[i]),
+                float(std5.iloc[i] / (std20.iloc[i] + 1e-12)),
+            ])
+            idx.append(i)
+        return X, idx
+    except Exception as e:
+        print("feat_matrix failed:", e)
+        return [], []
+
+
+def _feat_last(closes):
+    X, _ = _feat_matrix(closes)
+    return X[-1] if X else None
+
+
+def _ml_dataset(pair, closes):
+    """Backtest labels from candles + real labels from settled outcomes."""
+    X, idx = _feat_matrix(closes)
+    n = len(closes)
+    keep = [(x, i) for x, i in zip(X, idx) if i + HORIZON < n]
+    xs = [k[0] for k in keep]
+    ys = [1 if float(closes[k[1] + HORIZON]) > float(closes[k[1]]) else 0
+          for k in keep]
+    try:
+        fb = _ml_data_load()["pairs"].get(pair, {})
+        for vec, lab in zip(fb.get("X", []), fb.get("y", [])):
+            if isinstance(vec, (list, tuple)) and len(vec) == 16:
+                xs.append([float(v) for v in vec])
+                ys.append(1 if int(lab) else 0)
+    except Exception:
+        pass
+    return xs, ys
+
+
+def _ml_estimator(key):
+    """Each menu model is a real, different algorithm."""
+    from sklearn.ensemble import (RandomForestClassifier,
+                                  GradientBoostingClassifier,
+                                  ExtraTreesClassifier)
+    from sklearn.linear_model import LogisticRegression, SGDClassifier
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    if key == "lumina":
+        return GradientBoostingClassifier(n_estimators=120, max_depth=3,
+                                          learning_rate=0.08, subsample=0.8,
+                                          random_state=7)
+    if key == "astraq":
+        return ExtraTreesClassifier(n_estimators=150, max_depth=7,
+                                    random_state=11)
+    if key == "korra":
+        return make_pipeline(StandardScaler(),
+                             SGDClassifier(loss="log_loss", alpha=1e-3,
+                                           max_iter=1500, random_state=3))
+    if key == "cognimatic":
+        return make_pipeline(StandardScaler(),
+                             LogisticRegression(max_iter=800, C=0.5))
+    if key == "neovision":
+        return RandomForestClassifier(n_estimators=250, max_depth=8,
+                                      min_samples_leaf=5, random_state=21)
+    return RandomForestClassifier(n_estimators=150, max_depth=6,
+                                  random_state=42)
+
+
+def ml_train(pair, closes, keys=None, force=False):
+    """Fit/refresh models for a pair; honest temporal holdout accuracy."""
+    global _ml_learned_since
+    if not pair or not closes or len(closes) < 80:
+        return False
+    with _ml_lock:
+        try:
+            X, y = _ml_dataset(pair, closes)
+            if len(X) < ML_MIN_SAMPLES or len(set(y)) < 2:
+                return False
+            cut = int(len(X) * 0.8)
+            Xtr, ytr = X[:cut], y[:cut]
+            Xte, yte = X[cut:], y[cut:]
+            if len(set(ytr)) < 2:
+                Xtr, ytr = X, y
+                Xte, yte = X[-max(1, len(X) // 5):], y[-max(1, len(y) // 5):]
+            trained = False
+            for key in (keys or MODELS):
+                ck = f"{pair}#{key}"
+                meta = _ml_meta.get(ck) or {}
+                if (not force and key in _ml_models
+                        and time.time() - float(meta.get("trained_at", 0)) < ML_STALE_SEC):
+                    continue
+                try:
+                    clf = _ml_estimator(key)
+                    clf.fit(Xtr, ytr)
+                    acc = 0.0
+                    if Xte and len(set(yte)) >= 1:
+                        from sklearn.metrics import accuracy_score
+                        acc = float(accuracy_score(yte, clf.predict(Xte))) * 100.0
+                    _ml_models[ck] = clf
+                    _ml_meta[ck] = {"acc": round(acc, 1), "n": len(X),
+                                    "trained_at": time.time()}
+                    trained = True
+                except Exception as e:
+                    print(f"ML train {key} failed:", e)
+            if trained:
+                _ml_save()
+                _ml_learned_since = 0
+            return trained
+        except Exception as e:
+            print("ml_train failed:", e)
+            return False
+
+
+def ml_train_async(pair, tf=None, force=False):
+    """Retrain in the background so signals never wait on fitting."""
+    if not pair:
+        return
+    if not force:
+        now = time.time()
+        if any(k.startswith(pair + "#")
+               and now - float(v.get("trained_at", 0)) < ML_STALE_SEC
+               for k, v in _ml_meta.items()):
+            return
+    if pair in _ml_pending_train:
+        return
+    _ml_pending_train.add(pair)
+
+    def worker(p=pair, per=tf, fr=force):
+        try:
+            period = per or int(globals().get("sel_time", 60))
+            closes, _ = get_series(p, period, fetch=True)
+            if closes:
+                ml_train(p, closes, force=fr)
+        except Exception as e:
+            print("ML async train failed:", e)
+        finally:
+            _ml_pending_train.discard(p)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _ml_predict(closes, model=None):
+    """Real model probability score in [-1, 1]; learns on demand."""
+    try:
+        pair = str(globals().get("sel_pair") or "EURUSD-OTC")
+        key = str(model or globals().get("CURRENT_MODEL") or "solari")
+        ck = f"{pair}#{key}"
+        with _ml_lock:
+            est = _ml_models.get(ck)
+            meta = dict(_ml_meta.get(ck) or {})
+        stale = time.time() - float(meta.get("trained_at", 0)) > ML_STALE_SEC
+        if est is None:
+            if closes:
+                ml_train(pair, closes, keys=[key], force=True)
+            with _ml_lock:
+                est = _ml_models.get(ck)
+            if est is None:
+                ml_train_async(pair)
+                return 0.0
+        elif stale:
+            ml_train_async(pair)
+        X, _ = _feat_matrix(closes)
+        if not X:
+            return 0.0
+        proba = est.predict_proba([X[-1]])[0]
+        classes = list(getattr(est, "classes_", [0, 1]))
+        if 1 not in classes:
+            return 0.0
+        p1 = float(proba[classes.index(1)])
+        p0 = float(proba[classes.index(0)]) if 0 in classes else 1.0 - p1
+        return max(-1.0, min(1.0, p1 - p0))
+    except Exception as e:
+        print("ml_predict failed:", e)
         return 0.0
+
+
+def _ml_learn(pair, features, direction, win):
+    """Feedback: a settled signal outcome becomes training data."""
+    global _ml_learned_since
+    if not features or len(features) != 16:
+        return
+    if direction == "CALL":
+        label = 1 if win else 0
+    elif direction == "PUT":
+        label = 0 if win else 1
+    else:
+        return
+    try:
+        d = _ml_data_load()
+        pr = d["pairs"].setdefault(pair, {"X": [], "y": []})
+        pr["X"].append([round(float(v), 5) for v in features])
+        pr["y"].append(int(label))
+        if len(pr["y"]) > ML_MAX_SAMPLES:
+            pr["X"] = pr["X"][-ML_MAX_SAMPLES:]
+            pr["y"] = pr["y"][-ML_MAX_SAMPLES:]
+        _ml_data_save(d)
+        _ml_learned_since += 1
+        print(f"ML feedback {pair} {direction} -> {'up' if label else 'down'} "
+              f"(+{_ml_learned_since} since last train)")
+    except Exception as e:
+        print("ML learn failed:", e)
+    if _ml_learned_since >= 20:
+        ml_train_async(pair, force=True)
+
+
+def model_perf(key, last=50):
+    """Real measured win rate of a model from settled signals."""
+    try:
+        st = [x for x in track_load()["settled"]
+              if x.get("model") == key][-last:]
+        if not st:
+            return None, 0
+        w = sum(1 for x in st if x.get("win"))
+        return w / len(st) * 100.0, len(st)
+    except Exception:
+        return None, 0
 
 
 def _multi_tf_confluence(pair, period_sec):
@@ -569,7 +851,7 @@ def track_save(d):
     except Exception as e:
         print("Track save failed:", e)
 
-def track_add(pair, tf, direction, entry, model, regime):
+def track_add(pair, tf, direction, entry, model, regime, features=None):
     try:
         entry = float(entry)
     except Exception:
@@ -579,6 +861,7 @@ def track_add(pair, tf, direction, entry, model, regime):
         "id": int(time.time() * 1000),
         "pair": pair, "tf": int(tf), "dir": direction,
         "entry": entry, "model": model, "regime": regime,
+        "features": features,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "expire_at": time.time() + HORIZON * int(tf),
     })
@@ -623,6 +906,11 @@ def track_settle():
             "model": p.get("model"), "regime": p.get("regime"),
             "closed": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
+        try:
+            _ml_learn(p.get("pair", sel_pair_default()), p.get("features"),
+                      p.get("dir"), bool(win))
+        except Exception as e:
+            print("ML feedback skipped:", e)
         changed = True
         print(f"Settled {p['dir']} {p['pair']} entry={p['entry']} exit={px} "
               f"-> {'WIN' if win else 'LOSS'}")
@@ -1014,9 +1302,15 @@ def kb_model():
     rows = []
     for i in range(0, len(MODELS), 2):
         chunk = MODELS[i:i + 2]
-        rows.append([{"text": MODEL_NAMES[k], "callback_data": f"mdl:{k}"} for k in chunk])
+        rows.append([{"text": _model_btn(k), "callback_data": f"mdl:{k}"} for k in chunk])
     rows.append([{"text": "Back to Menu", "callback_data": "ui:menu"}])
     return rows
+
+def _model_btn(key):
+    pct, n = model_perf(key)
+    if pct is None or n < 3:
+        return MODEL_NAMES[key]
+    return f"{MODEL_NAMES[key]} {pct:.0f}%"
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
@@ -1153,6 +1447,16 @@ def card_caption(res, m, conf, pair, tf_txt):
     news_s = res.get("news_sentiment", 0.0)
     social_s = res.get("social_sentiment", 0.0)
     regime = res.get("regime", "normal")
+    mkey = str(globals().get("sel_model") or "solari")
+    learn_parts = []
+    lpct, ln = model_perf(mkey)
+    if lpct is not None and ln >= 3:
+        learn_parts.append(f"<b>{lpct:.0f}%</b> win rate ({ln} settled)")
+    mmeta = _ml_meta.get(f"{pair}#{mkey}") or {}
+    if mmeta.get("acc"):
+        learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
+    learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)} learning: "
+                  f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
     return (
         f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
         f"\U0001fab6 Market info:\n"
@@ -1172,6 +1476,7 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u00b7 {m.get('n_signals', 0)} past signals checked\n"
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
+        f"{learn_line}"
         f"\u26a1 News: <b>{'Bullish' if news_s > 0 else 'Bearish' if news_s < 0 else 'Neutral'}</b> ({abs(news_s):.2f})\n"
         f"\U0001f4e1 Social: <b>{'Bullish' if social_s > 0 else 'Bearish' if social_s < 0 else 'Neutral'}</b> ({abs(social_s):.2f})\n\n"
         f"{now_hm()}"
@@ -1237,6 +1542,8 @@ if __name__ == "__main__":
     auto_tick = 0.0
     last_page = 0
     warm_feed(sel_pair, sel_time, wait=20.0)
+    _ml_load()
+    ml_train_async(sel_pair, sel_time)
 
     WATCH_REFRESH = 15
     WATCH_ALERT_GAP = 120
@@ -1277,7 +1584,12 @@ if __name__ == "__main__":
              chat_id=chat, keyboard=kb_menu(), html_on=True)
 
     def send_model_screen(chat, edit_mid=None):
-        text = f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>"
+        label = MODEL_PARAMS.get(sel_model, {}).get("label", "")
+        pct, n = model_perf(sel_model)
+        stats = (f" \u00b7 <b>{pct:.0f}%</b> from {n} settled signals"
+                 if pct is not None and n >= 3 else " \u00b7 learning")
+        text = (f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>\n\n"
+                f"\U0001f9e0 {MODEL_NAMES.get(sel_model, sel_model)}: {label}{stats}")
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_model()}})
@@ -1374,7 +1686,13 @@ if __name__ == "__main__":
             values.append(val)
             reveal(GEN_PCT[idx])
         time.sleep(0.4)
-        return send_result(res, chat, m, conf, closes)
+        ok = send_result(res, chat, m, conf, closes)
+        if ok and res.get("signal") in ("CALL", "PUT"):
+            track_add(sel_pair, sel_time, res["signal"], m.get("price"),
+                      sel_model, res.get("regime"),
+                      features=_feat_last(closes))
+            ml_train_async(sel_pair, sel_time)
+        return ok
 
     _processed_cbs = set()
 
@@ -1407,6 +1725,7 @@ if __name__ == "__main__":
                     globals()["CURRENT_MODEL"] = key
                     persist()
                     warm_feed(sel_pair, sel_time)
+                    ml_train_async(sel_pair, sel_time)
                     mid = cb.get("message", {}).get("message_id")
                     send_market_screen(chat, edit_mid=mid)
             elif data == "ui:market":
@@ -1428,6 +1747,7 @@ if __name__ == "__main__":
                 sel_pair = data.split(":", 1)[1]
                 persist()
                 warm_feed(sel_pair, sel_time)
+                ml_train_async(sel_pair, sel_time)
                 mid = cb.get("message", {}).get("message_id")
                 send_time_screen(chat, edit_mid=mid)
             elif data == "ui:pairback":
@@ -1507,6 +1827,9 @@ if __name__ == "__main__":
                     closes_w = rep.get("closes") or [r["c"] for r in (ohlc or [])]
                     m = tech_metrics(closes_w, ohlc, st)
                     send_card(watch["chat"], st, m, gate_score(st), closes_w)
+                    track_add(sel_pair, sel_time, st["signal"], m.get("price"),
+                              globals().get("sel_model", "solari"),
+                              st.get("regime"), features=_feat_last(closes_w))
                     print(f"Watch alert {st['signal']} {sel_pair}")
 
         if auto_on and owner_id and time.time() - auto_tick >= 60:
@@ -1524,6 +1847,14 @@ if __name__ == "__main__":
                     ohlc = fetch_ohlc(sel_pair, sel_time)
                     m = tech_metrics(closes, ohlc, res)
                     send_card(owner_id, res, m, gate_score(res), closes)
+                    track_add(sel_pair, sel_time, res["signal"], m.get("price"),
+                              sel_model, res.get("regime"),
+                              features=_feat_last(closes))
                     print(f"Auto {res['signal']} {sel_pair} {tf_label(sel_time)}")
+
+        try:
+            track_settle()
+        except Exception:
+            pass
 
         time.sleep(5)
