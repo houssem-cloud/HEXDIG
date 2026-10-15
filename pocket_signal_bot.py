@@ -271,7 +271,7 @@ def _compute_volume(closes):
     return {"vol": vol_label, "vol_pct": vol_pct}
 
 
-def analyze(closes, model=None, news_symbol=None):
+def analyze(closes, model=None, news_symbol=None, use_llm=False):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["solari"])
     out = {"signal": "WAIT", "accuracy": 0.0, "note": "", "rsi": None,
@@ -373,7 +373,61 @@ def analyze(closes, model=None, news_symbol=None):
     out["confidence"] = conf_final
     out["signal"] = decide_at(stk, i, params) or "WAIT"
     out["accuracy"] = out["measured"]
+
+    if use_llm:
+        try:
+            import llm_brain
+            llm = llm_brain.analyze(_llm_context(out, closes))
+        except Exception as e:
+            print("LLM skipped:", e)
+            llm = None
+        if llm:
+            out["llm"] = llm
+            out["confidence_factors"]["llm"] = float(llm.get("confidence") or 0)
+            ls = str(llm.get("signal") or "").upper()
+            lc = float(llm.get("confidence") or 0)
+            if ls in ("CALL", "PUT") and lc >= 65:
+                out["signal"] = ls
+                out["setup"] = True
+            elif ls == "WAIT" and lc >= 75 and out["signal"] in ("CALL", "PUT"):
+                out["signal"] = "WAIT"
     return out
+
+
+def _llm_context(res, closes):
+    """Compact market snapshot for the free LLM brain."""
+    try:
+        price = round(float(closes[-1]), 5)
+    except Exception:
+        price = None
+    w, l, pct, n = track_summary(10)
+    aw, al, apct, an = account_perf(20)
+    payout = None
+    try:
+        if pocket_payout is not None:
+            payout = pocket_payout.get_payout(
+                str(globals().get("sel_pair") or ""))
+    except Exception:
+        pass
+    try:
+        tail = [round(float(x), 5) for x in list(closes)[-25:]]
+    except Exception:
+        tail = []
+    return {
+        "pair": str(globals().get("sel_pair") or "EURUSD-OTC"),
+        "tf": int(globals().get("sel_time") or 60),
+        "price": price,
+        "payout": payout,
+        "closes": tail,
+        "rsi": (round(float(res["rsi"]), 1) if res.get("rsi") is not None else None),
+        "regime": res.get("regime"),
+        "vol_pct": (round(float(res.get("vol_pct", 50)), 0)
+                    if res.get("vol_pct") is not None else None),
+        "price_action": res.get("price_action"),
+        "tf_confluence": res.get("tf_confluence"),
+        "signals_last10": f"{w}W/{l}L" if n else "none",
+        "account_recent": f"{aw}W/{al}L {apct:.0f}%" if an else "none",
+    }
 
 
 # ===== REAL ML: models learn from candles + settled signal outcomes =====
@@ -815,6 +869,8 @@ def gate_score(res, model=None):
     pa_score = res.get("price_action", 0.0)
     tf_confluence = res.get("tf_confluence", 0.0)
     adaptive = res.get("adaptive_factor", 1.0)
+    llm = res.get("llm")
+    llm_adj = ((float(llm.get("confidence") or 50) - 50) * 0.35) if llm else 0.0
     news_adj = news_s * 10
     social_adj = social_s * 5
     ml_adj = ml_score * 8
@@ -823,7 +879,7 @@ def gate_score(res, model=None):
     volume_factor = 1.0 if volume_pct >= 50 else 0.95
     regime = res.get("regime", "normal")
     regime_factor = 1.1 if regime == "squeeze" else 1.0
-    adjusted = base + news_adj + social_adj + ml_adj + pa_adj + tf_adj
+    adjusted = base + news_adj + social_adj + ml_adj + pa_adj + tf_adj + llm_adj
     adjusted = adjusted * volume_factor * regime_factor * adaptive
     return max(5.0, min(98.0, adjusted))
 
@@ -1619,6 +1675,18 @@ def card_caption(res, m, conf, pair, tf_txt):
         learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
     learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)}: "
                   f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
+    llm = res.get("llm")
+    llm_line = ""
+    if llm:
+        tag = {"groq": "Llama 3.3 70B", "gemini": "Gemini Flash",
+               "openrouter": "Open model"}.get(str(llm.get("provider") or ""),
+                                               "AI")
+        sig = str(llm.get("signal") or "?")
+        conf = float(llm.get("confidence") or 0)
+        reason = html.escape(str(llm.get("reason") or "")[:60])
+        llm_line = (f"\U0001f9e0 AI brain ({tag}): <b>{sig} {conf:.0f}%</b>\n"
+                    f"\u2022 {reason}\n\n" if reason else
+                    f"\U0001f9e0 AI brain ({tag}): <b>{sig} {conf:.0f}%</b>\n\n")
     win_lines = []
     aw, al, apct, an = account_perf()
     if an >= 1:
@@ -1650,6 +1718,7 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
         f"{learn_line}"
+        f"{llm_line}"
         f"{win_line}"
         f"{now_hm()}"
     )
@@ -1836,7 +1905,8 @@ if __name__ == "__main__":
         if pocket_payout is not None and DATA_SRC != "live stream":
             if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
                 closes, note = get_series(sel_pair, sel_time, fetch=True)
-        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""),
+                      use_llm=True)
         res["demo"] = bool(note)
         ohlc = fetch_ohlc(sel_pair, sel_time)
         m = tech_metrics(closes, ohlc, res)
@@ -2029,7 +2099,7 @@ if __name__ == "__main__":
             closes, note = get_series(sel_pair, sel_time, fetch=True)
             if note or not closes:
                 continue
-            res = analyze(closes, sel_model)
+            res = analyze(closes, sel_model, use_llm=True)
             if res["signal"] in ("CALL", "PUT") and res.get("setup"):
                 key = f"{sel_pair}#{sel_time}#{sel_model}"
                 if time.time() - last_state.get(key, 0) >= COOLDOWN_SEC:
