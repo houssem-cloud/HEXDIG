@@ -1964,7 +1964,7 @@ if __name__ == "__main__":
         try:
             closes, note = get_series(sel_pair, sel_time, fetch=True)
             if pocket_payout is not None and DATA_SRC != "live stream":
-                if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
+                if pocket_payout.start_live(sel_pair, sel_time, wait=3.0):
                     closes, note = get_series(sel_pair, sel_time, fetch=True)
             res = None
             if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
@@ -2086,7 +2086,7 @@ if __name__ == "__main__":
                 except Exception:
                     sel_time = 60
                 persist()
-                warm_feed(sel_pair, sel_time)
+                warm_feed(sel_pair, sel_time, wait=3.0)
                 run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
