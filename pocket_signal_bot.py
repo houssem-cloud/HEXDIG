@@ -1449,14 +1449,17 @@ def card_caption(res, m, conf, pair, tf_txt):
     regime = res.get("regime", "normal")
     mkey = str(globals().get("sel_model") or "solari")
     learn_parts = []
-    lpct, ln = model_perf(mkey)
-    if lpct is not None and ln >= 3:
-        learn_parts.append(f"<b>{lpct:.0f}%</b> win rate ({ln} settled)")
     mmeta = _ml_meta.get(f"{pair}#{mkey}") or {}
     if mmeta.get("acc"):
         learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
-    learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)} learning: "
+    learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)}: "
                   f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
+    win_line = ""
+    lpct, ln = model_perf(mkey)
+    if ln >= 1:
+        w = int(round(lpct / 100.0 * ln))
+        win_line = (f"\U0001f3c6 Win / Loss: <b>{w}W / {ln - w}L</b> "
+                    f"(<b>{lpct:.0f}%</b> win rate \u00b7 last {ln} signals)\n\n")
     return (
         f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
         f"\U0001fab6 Market info:\n"
@@ -1477,8 +1480,7 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
         f"{learn_line}"
-        f"\u26a1 News: <b>{'Bullish' if news_s > 0 else 'Bearish' if news_s < 0 else 'Neutral'}</b> ({abs(news_s):.2f})\n"
-        f"\U0001f4e1 Social: <b>{'Bullish' if social_s > 0 else 'Bearish' if social_s < 0 else 'Neutral'}</b> ({abs(social_s):.2f})\n\n"
+        f"{win_line}"
         f"{now_hm()}"
     )
 
