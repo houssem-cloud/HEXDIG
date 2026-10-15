@@ -1961,62 +1961,65 @@ if __name__ == "__main__":
                 edit(gen_text(pct, values), chat, mid)
             time.sleep(0.4)
 
-        closes, note = get_series(sel_pair, sel_time, fetch=True)
-        if pocket_payout is not None and DATA_SRC != "live stream":
-            if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
-                closes, note = get_series(sel_pair, sel_time, fetch=True)
-        res = None
-        if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
-            try:
-                ml_train(sel_pair, closes, keys=MODELS, force=False)
-            except Exception:
-                pass
-            candidates = []
-            for m in MODELS:
-                try:
-                    r = analyze(closes, m, news_symbol=sel_pair.replace("-OTC", ""))
-                    if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
-                        candidates.append((m, r))
-                except Exception:
-                    continue
-            if candidates:
-                bm, br = bandit_select(candidates)
-                if bm:
-                    sel_model = bm
-                    globals()["CURRENT_MODEL"] = bm
-                    res = br
-                    res["bandit_model"] = bm
-        if res is None:
-            res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
-        res["demo"] = bool(note)
-        ohlc = fetch_ohlc(sel_pair, sel_time)
-        m = tech_metrics(closes, ohlc, res)
-        conf = gate_score(res, sel_model)
+        try:
+            closes, note = get_series(sel_pair, sel_time, fetch=True)
+            if pocket_payout is not None and DATA_SRC != "live stream":
+                if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
+                    closes, note = get_series(sel_pair, sel_time, fetch=True)
+            res = None
+            if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
+                candidates = []
+                for m in MODELS:
+                    try:
+                        r = analyze(closes, m, news_symbol=sel_pair.replace("-OTC", ""))
+                        if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
+                            candidates.append((m, r))
+                    except Exception:
+                        continue
+                if candidates:
+                    bm, br = bandit_select(candidates)
+                    if bm:
+                        sel_model = bm
+                        globals()["CURRENT_MODEL"] = bm
+                        res = br
+                        res["bandit_model"] = bm
+            if res is None:
+                res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+            res["demo"] = bool(note)
+            ohlc = fetch_ohlc(sel_pair, sel_time)
+            m = tech_metrics(closes, ohlc, res)
+            conf = gate_score(res, sel_model)
 
-        params = MODEL_PARAMS[sel_model]
-        reveal_vals = [
-            f"{m['vol']} \u26a1",
-            (f"{m['rsi_label']} ({res['rsi']:.1f})" if res.get("rsi") is not None
-             else m["rsi_label"]),
-            m["macd"],
-            m["ma"],
-            f"{m['asset_strength']:.0f}%",
-            f"{m['volume_result']:.0f}%",
-            f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
-            f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
-            f"{conf:.0f}% ({res.get('full_total', 0)} past signals)",
-        ]
-        for idx, val in enumerate(reveal_vals):
-            values.append(val)
-            reveal(GEN_PCT[idx])
-        time.sleep(0.4)
-        ok = send_result(res, chat, m, conf, closes)
-        if ok and res.get("signal") in ("CALL", "PUT"):
-            track_add(sel_pair, sel_time, res["signal"], m.get("price"),
-                      sel_model, res.get("regime"),
-                      features=_feat_last(closes))
-            ml_train_async(sel_pair, sel_time)
-        return ok
+            params = MODEL_PARAMS[sel_model]
+            reveal_vals = [
+                f"{m['vol']} \u26a1",
+                (f"{m['rsi_label']} ({res['rsi']:.1f})" if res.get("rsi") is not None
+                 else m["rsi_label"]),
+                m["macd"],
+                m["ma"],
+                f"{m['asset_strength']:.0f}%",
+                f"{m['volume_result']:.0f}%",
+                f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
+                f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
+                f"{conf:.0f}% ({res.get('full_total', 0)} past signals)",
+            ]
+            for idx, val in enumerate(reveal_vals):
+                values.append(val)
+                reveal(GEN_PCT[idx])
+            time.sleep(0.4)
+            ok = send_result(res, chat, m, conf, closes)
+            if ok and res.get("signal") in ("CALL", "PUT"):
+                track_add(sel_pair, sel_time, res["signal"], m.get("price"),
+                          sel_model, res.get("regime"),
+                          features=_feat_last(closes))
+                ml_train_async(sel_pair, sel_time)
+            return ok
+        except Exception as e:
+            print(f"run_generation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            edit("❌ Signal generation failed. Try again.", chat, mid, html_on=True)
+            return False
 
     _processed_cbs = set()
 
