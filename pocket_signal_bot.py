@@ -1951,7 +1951,7 @@ if __name__ == "__main__":
         return send_card(chat, res, m, conf, closes)
 
     def run_generation(chat):
-        global CURRENT_MODEL
+        global CURRENT_MODEL, sel_model
         CURRENT_MODEL = sel_model
         mid = send(gen_text(0, []), chat_id=chat)
         values = []
@@ -1963,28 +1963,7 @@ if __name__ == "__main__":
 
         try:
             closes, note = get_series(sel_pair, sel_time, fetch=True)
-            if pocket_payout is not None and DATA_SRC != "live stream":
-                if pocket_payout.start_live(sel_pair, sel_time, wait=3.0):
-                    closes, note = get_series(sel_pair, sel_time, fetch=True)
-            res = None
-            if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
-                candidates = []
-                for m in MODELS:
-                    try:
-                        r = analyze(closes, m, news_symbol=sel_pair.replace("-OTC", ""))
-                        if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
-                            candidates.append((m, r))
-                    except Exception:
-                        continue
-                if candidates:
-                    bm, br = bandit_select(candidates)
-                    if bm:
-                        sel_model = bm
-                        globals()["CURRENT_MODEL"] = bm
-                        res = br
-                        res["bandit_model"] = bm
-            if res is None:
-                res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+            res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
             res["demo"] = bool(note)
             ohlc = fetch_ohlc(sel_pair, sel_time)
             m = tech_metrics(closes, ohlc, res)
@@ -2012,7 +1991,6 @@ if __name__ == "__main__":
                 track_add(sel_pair, sel_time, res["signal"], m.get("price"),
                           sel_model, res.get("regime"),
                           features=_feat_last(closes))
-                ml_train_async(sel_pair, sel_time)
             return ok
         except Exception as e:
             print(f"run_generation failed: {e}")
