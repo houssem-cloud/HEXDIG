@@ -1604,28 +1604,7 @@ if __name__ == "__main__":
                  f"a few seconds - a signal is always given once the data is ready.",
                  chat_id=chat, keyboard=kb_signal(), html_on=True)
             return False
-        buy = res["signal"] == "CALL"
-        word = "BUY" if buy else "SELL"
-        # BIG LOWER/HIGHER style
-        big_word = "BUY" if buy else "SELL"
-        mkt = "OTC" if pair.endswith("-OTC") else "Stock"
-        text = (f"{screen_head(f'{mkt} MARKET')}\n"
-                f"{'BUY' if buy else 'SELL'}\n\n"
-                f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word}\n\n"
-                f"\U0001fab6 Market info:\n"
-                f"\u2022 Volatility: <b>{m['vol']}</b>\n"
-                f"\u2022 Asset strength by volume: <b>{m['asset_strength']:.0f}%</b>\n"
-                f"\u2022 Volume result: <b>{m['volume_result']:.0f}%</b>\n"
-                f"\u2022 Sentiment: <b>{m['sentiment']}</b>\n\n"
-                f"\U0001f9ed Technical overview:\n"
-                f"\u2022 Current price: <b>{price(m['price'])} {mkt}</b>\n"
-                f"\u2022 Resistance (R1): <b>{price(m['r1'])}</b>\n"
-                f"\u2022 Support (S1): <b>{price(m['s1'])}</b>\n"
-                f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
-                f"\u2022 MACD: <b>{m['macd']}</b>\n"
-                f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
-                f"{now_hm()}")
-        return send(text, chat_id=chat, keyboard=kb_signal_retry(), html_on=True)
+        return send_card(chat, res, m, conf, closes)
 
     def run_generation(chat):
         global CURRENT_MODEL, sel_model
@@ -1670,10 +1649,10 @@ if __name__ == "__main__":
                           features=_feat_last(closes))
             return ok
         except Exception as e:
-            print(f"run_generation failed: {e}")
+            print(f"run_generation failed: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-            edit("❌ Signal generation failed. Try again.", chat, mid, html_on=True)
+            edit(f"❌ Signal generation failed: {type(e).__name__}. Check bot.log.", chat, mid, html_on=True)
             return False
 
     _processed_cbs = set()
