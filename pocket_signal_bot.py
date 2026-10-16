@@ -26,15 +26,11 @@ import json
 import os
 import html
 import threading
-import random
 import requests
 import datetime
 import pandas as pd
 import numpy as np
 from collections import deque
-
-# ===== thread safety for shared track file =====
-_track_lock = threading.RLock()
 
 # ===== NEWS & SENTIMENT =====
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
@@ -350,7 +346,7 @@ def analyze(closes, model=None, news_symbol=None):
     conf_adjusted = conf_base * (1 + sentiment_weight * news_s) if news_s else conf_base
     regime_factor = 1.0 if out["regime"] == "squeeze" else (1.1 if out["regime"] == "normal" else 0.9)
 
-    ml_score = 0.0
+    ml_score = _ml_predict(closes, model=model)
     out["ml_score"] = ml_score
     out["confidence_factors"]["ml"] = ml_score
 
@@ -380,70 +376,307 @@ def analyze(closes, model=None, news_symbol=None):
     return out
 
 
-# ===== Edge statistics: real win rate per (model, regime) =====
-EDGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_stats.json")
+# ===== REAL ML: models learn from candles + settled signal outcomes =====
+ML_DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_data.json")
+ML_MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_models.pkl")
+ML_STALE_SEC = 900          # background refresh interval
+ML_MAX_SAMPLES = 3000       # feedback samples kept per pair
+ML_MIN_SAMPLES = 100        # minimum samples before a model trains
+
+_ml_lock = threading.RLock()
+_ml_models = {}        # "pair#model" -> fitted estimator
+_ml_meta = {}          # "pair#model" -> {"acc", "n", "trained_at"}
+_ml_pending_train = set()
+_ml_learned_since = 0
 
 
-def _edge_load():
+def _ml_data_load():
     try:
-        with open(EDGE_FILE) as f:
+        with open(ML_DATA_FILE) as f:
             d = json.load(f)
-        if isinstance(d, dict):
+        if isinstance(d, dict) and isinstance(d.get("pairs"), dict):
             return d
     except Exception:
         pass
-    return {}
+    return {"pairs": {}}
 
 
-def _edge_save(d):
+def _ml_data_save(d):
     try:
-        with open(EDGE_FILE, "w") as f:
+        with open(ML_DATA_FILE, "w") as f:
             json.dump(d, f)
     except Exception as e:
-        print("Edge save failed:", e)
+        print("ML data save failed:", e)
 
 
-def _edge_key(model, regime):
-    return f"{model}|{regime}"
-
-
-def _edge_record(model, regime, win):
-    if not model:
-        return
-    d = _edge_load()
-    key = _edge_key(model, regime)
-    rec = d.get(key, {"w": 0, "l": 0})
-    if win:
-        rec["w"] = int(rec.get("w", 0)) + 1
-    else:
-        rec["l"] = int(rec.get("l", 0)) + 1
-    d[key] = rec
-    _edge_save(d)
-
-
-def edge_perf(model, regime):
-    """Win rate for a (model, regime) combination. Returns (w, l, pct, n)."""
-    if not model:
-        return 0, 0, None, 0
-    d = _edge_load()
-    rec = d.get(_edge_key(model, regime), {})
-    w = int(rec.get("w", 0))
-    l = int(rec.get("l", 0))
-    n = w + l
-    return w, l, (w / n * 100.0) if n else None, n
-
-
-def model_perf(key, last=50):
-    """Win rate for a model from settled signals."""
+def _ml_save():
     try:
-        st = [x for x in track_load()["settled"]
-              if x.get("model") == key][-last:]
-        if not st:
-            return None, 0
-        w = sum(1 for x in st if x.get("win"))
-        return w / len(st) * 100.0, len(st)
+        import pickle
+        with open(ML_MODEL_FILE, "wb") as f:
+            pickle.dump({"models": _ml_models, "meta": _ml_meta}, f)
+    except Exception as e:
+        print("ML model save failed:", e)
+
+
+def _ml_load():
+    try:
+        import pickle
+        if os.path.exists(ML_MODEL_FILE):
+            with open(ML_MODEL_FILE, "rb") as f:
+                d = pickle.load(f)
+            _ml_models.update(d.get("models") or {})
+            _ml_meta.update(d.get("meta") or {})
+            print(f"ML: loaded {len(_ml_models)} trained models")
+    except Exception as e:
+        print("ML model load failed:", e)
+
+
+def _feat_matrix(closes):
+    """16 real features per bar: returns, RSI, MACD, bands, trend, flow."""
+    try:
+        vals = [float(x) for x in closes]
+        if len(vals) < 70:
+            return [], []
+        s = pd.Series(vals)
+        n = len(s)
+        delta = s.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi = (100 - 100 / (1 + gain / (loss + 1e-12)) - 50) / 50
+        ema9 = s.ewm(span=9, adjust=False).mean()
+        ema21 = s.ewm(span=21, adjust=False).mean()
+        macd = ema9 - ema21
+        hist = macd - macd.ewm(span=9, adjust=False).mean()
+        sma20 = s.rolling(20).mean()
+        std20 = s.rolling(20).std()
+        std5 = s.rolling(5).std()
+        sma50 = s.rolling(50).mean()
+        hh = s.rolling(14).max()
+        ll = s.rolling(14).min()
+        pb = ((s - (sma20 - 2 * std20)) / (4 * std20 + 1e-12) - 0.5) * 2
+        stoch = ((s - ll) / (hh - ll + 1e-12) - 0.5) * 2
+        up10 = (delta > 0).rolling(10).mean() * 2 - 1
+        up3 = (delta > 0).rolling(3).mean() * 2 - 1
+        ret1 = s.pct_change() * 1000
+        ret3 = s.pct_change(3) * 1000
+        ret5 = s.pct_change(5) * 1000
+        ret10 = s.pct_change(10) * 1000
+        X, idx = [], []
+        for i in range(60, n):
+            if pd.isna(pb.iloc[i]) or pd.isna(sma50.iloc[i]) or pd.isna(std5.iloc[i]):
+                continue
+            c = vals[i]
+            X.append([
+                float(ret1.iloc[i]), float(ret3.iloc[i]),
+                float(ret5.iloc[i]), float(ret10.iloc[i]),
+                float(rsi.iloc[i]),
+                float(hist.iloc[i] / c * 1000),
+                float(macd.iloc[i] / c * 1000),
+                float(pb.iloc[i]),
+                float(std20.iloc[i] / c * 1000),
+                float((sma20.iloc[i] - sma20.iloc[i - 5]) / c * 1000),
+                float((c - sma20.iloc[i]) / c * 1000),
+                float((c - sma50.iloc[i]) / c * 1000),
+                float(stoch.iloc[i]),
+                float(up10.iloc[i]),
+                float(up3.iloc[i]),
+                float(std5.iloc[i] / (std20.iloc[i] + 1e-12)),
+            ])
+            idx.append(i)
+        return X, idx
+    except Exception as e:
+        print("feat_matrix failed:", e)
+        return [], []
+
+
+def _feat_last(closes):
+    X, _ = _feat_matrix(closes)
+    return X[-1] if X else None
+
+
+def _ml_dataset(pair, closes):
+    """Backtest labels from candles + real labels from settled outcomes."""
+    X, idx = _feat_matrix(closes)
+    n = len(closes)
+    keep = [(x, i) for x, i in zip(X, idx) if i + HORIZON < n]
+    xs = [k[0] for k in keep]
+    ys = [1 if float(closes[k[1] + HORIZON]) > float(closes[k[1]]) else 0
+          for k in keep]
+    try:
+        fb = _ml_data_load()["pairs"].get(pair, {})
+        for vec, lab in zip(fb.get("X", []), fb.get("y", [])):
+            if isinstance(vec, (list, tuple)) and len(vec) == 16:
+                xs.append([float(v) for v in vec])
+                ys.append(1 if int(lab) else 0)
     except Exception:
-        return None, 0
+        pass
+    return xs, ys
+
+
+def _ml_estimator(key):
+    """Each menu model is a real, different algorithm."""
+    from sklearn.ensemble import (RandomForestClassifier,
+                                  GradientBoostingClassifier,
+                                  ExtraTreesClassifier)
+    from sklearn.linear_model import LogisticRegression, SGDClassifier
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    if key == "lumina":
+        return GradientBoostingClassifier(n_estimators=120, max_depth=3,
+                                          learning_rate=0.08, subsample=0.8,
+                                          random_state=7)
+    if key == "astraq":
+        return ExtraTreesClassifier(n_estimators=150, max_depth=7,
+                                    random_state=11)
+    if key == "korra":
+        return make_pipeline(StandardScaler(),
+                             SGDClassifier(loss="log_loss", alpha=1e-3,
+                                           max_iter=1500, random_state=3))
+    if key == "cognimatic":
+        return make_pipeline(StandardScaler(),
+                             LogisticRegression(max_iter=800, C=0.5))
+    if key == "neovision":
+        return RandomForestClassifier(n_estimators=250, max_depth=8,
+                                      min_samples_leaf=5, random_state=21)
+    return RandomForestClassifier(n_estimators=150, max_depth=6,
+                                  random_state=42)
+
+
+def ml_train(pair, closes, keys=None, force=False):
+    """Fit/refresh models for a pair; honest temporal holdout accuracy."""
+    global _ml_learned_since
+    if not pair or not closes or len(closes) < 80:
+        return False
+    with _ml_lock:
+        try:
+            X, y = _ml_dataset(pair, closes)
+            if len(X) < ML_MIN_SAMPLES or len(set(y)) < 2:
+                return False
+            cut = int(len(X) * 0.8)
+            Xtr, ytr = X[:cut], y[:cut]
+            Xte, yte = X[cut:], y[cut:]
+            if len(set(ytr)) < 2:
+                Xtr, ytr = X, y
+                Xte, yte = X[-max(1, len(X) // 5):], y[-max(1, len(y) // 5):]
+            trained = False
+            for key in (keys or MODELS):
+                ck = f"{pair}#{key}"
+                meta = _ml_meta.get(ck) or {}
+                if (not force and key in _ml_models
+                        and time.time() - float(meta.get("trained_at", 0)) < ML_STALE_SEC):
+                    continue
+                try:
+                    clf = _ml_estimator(key)
+                    clf.fit(Xtr, ytr)
+                    acc = 0.0
+                    if Xte and len(set(yte)) >= 1:
+                        from sklearn.metrics import accuracy_score
+                        acc = float(accuracy_score(yte, clf.predict(Xte))) * 100.0
+                    _ml_models[ck] = clf
+                    _ml_meta[ck] = {"acc": round(acc, 1), "n": len(X),
+                                    "trained_at": time.time()}
+                    trained = True
+                except Exception as e:
+                    print(f"ML train {key} failed:", e)
+            if trained:
+                _ml_save()
+                _ml_learned_since = 0
+            return trained
+        except Exception as e:
+            print("ml_train failed:", e)
+            return False
+
+
+def ml_train_async(pair, tf=None, force=False):
+    """Retrain in the background so signals never wait on fitting."""
+    if not pair:
+        return
+    if not force:
+        now = time.time()
+        if any(k.startswith(pair + "#")
+               and now - float(v.get("trained_at", 0)) < ML_STALE_SEC
+               for k, v in _ml_meta.items()):
+            return
+    if pair in _ml_pending_train:
+        return
+    _ml_pending_train.add(pair)
+
+    def worker(p=pair, per=tf, fr=force):
+        try:
+            period = per or int(globals().get("sel_time", 60))
+            closes, _ = get_series(p, period, fetch=True)
+            if closes:
+                ml_train(p, closes, force=fr)
+        except Exception as e:
+            print("ML async train failed:", e)
+        finally:
+            _ml_pending_train.discard(p)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _ml_predict(closes, model=None):
+    """Real model probability score in [-1, 1]; learns on demand."""
+    try:
+        pair = str(globals().get("sel_pair") or "EURUSD-OTC")
+        key = str(model or globals().get("CURRENT_MODEL") or "solari")
+        ck = f"{pair}#{key}"
+        with _ml_lock:
+            est = _ml_models.get(ck)
+            meta = dict(_ml_meta.get(ck) or {})
+        stale = time.time() - float(meta.get("trained_at", 0)) > ML_STALE_SEC
+        if est is None:
+            if closes:
+                ml_train(pair, closes, keys=[key], force=True)
+            with _ml_lock:
+                est = _ml_models.get(ck)
+            if est is None:
+                ml_train_async(pair)
+                return 0.0
+        elif stale:
+            ml_train_async(pair)
+        X, _ = _feat_matrix(closes)
+        if not X:
+            return 0.0
+        proba = est.predict_proba([X[-1]])[0]
+        classes = list(getattr(est, "classes_", [0, 1]))
+        if 1 not in classes:
+            return 0.0
+        p1 = float(proba[classes.index(1)])
+        p0 = float(proba[classes.index(0)]) if 0 in classes else 1.0 - p1
+        return max(-1.0, min(1.0, p1 - p0))
+    except Exception as e:
+        print("ml_predict failed:", e)
+        return 0.0
+
+
+def _ml_learn(pair, features, direction, win):
+    """Feedback: a settled signal outcome becomes training data."""
+    global _ml_learned_since
+    if not features or len(features) != 16:
+        return
+    if direction == "CALL":
+        label = 1 if win else 0
+    elif direction == "PUT":
+        label = 0 if win else 1
+    else:
+        return
+    try:
+        d = _ml_data_load()
+        pr = d["pairs"].setdefault(pair, {"X": [], "y": []})
+        pr["X"].append([round(float(v), 5) for v in features])
+        pr["y"].append(int(label))
+        if len(pr["y"]) > ML_MAX_SAMPLES:
+            pr["X"] = pr["X"][-ML_MAX_SAMPLES:]
+            pr["y"] = pr["y"][-ML_MAX_SAMPLES:]
+        _ml_data_save(d)
+        _ml_learned_since += 1
+        print(f"ML feedback {pair} {direction} -> {'up' if label else 'down'} "
+              f"(+{_ml_learned_since} since last train)")
+    except Exception as e:
+        print("ML learn failed:", e)
+    if _ml_learned_since >= 20:
+        ml_train_async(pair, force=True)
 
 
 def model_perf(key, last=50):
@@ -578,18 +811,15 @@ def gate_score(res, model=None):
     news_s = res.get("news_sentiment", 0.0)
     social_s = res.get("social_sentiment", 0.0)
     volume_pct = res.get("vol_pct", 50.0)
-    ml_score = 0.0
+    ml_score = res.get("ml_score", 0.0)
     pa_score = res.get("price_action", 0.0)
     tf_confluence = res.get("tf_confluence", 0.0)
     adaptive = res.get("adaptive_factor", 1.0)
     news_adj = news_s * 10
     social_adj = social_s * 5
-    ml_adj = 0.0
+    ml_adj = ml_score * 8
     pa_adj = pa_score * 3
     tf_adj = tf_confluence * 5
-    ew, el, epct, en = edge_perf(model, res.get("regime"))
-    if en >= 10 and epct < 45.0:
-        adjusted *= 0.85
     volume_factor = 1.0 if volume_pct >= 50 else 0.95
     regime = res.get("regime", "normal")
     regime_factor = 1.1 if regime == "squeeze" else 1.0
@@ -603,26 +833,23 @@ TRACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "signal_track.json")
 
 def track_load():
-    with _track_lock:
-        try:
-            with open(TRACK_FILE) as f:
-                d = json.load(f)
-            if isinstance(d, dict):
-                d.setdefault("pending", [])
-                d.setdefault("settled", [])
-                return d
-        except Exception:
-            pass
-        return {"pending": [], "settled": []}
-
+    try:
+        with open(TRACK_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("pending", [])
+            d.setdefault("settled", [])
+            return d
+    except Exception:
+        pass
+    return {"pending": [], "settled": []}
 
 def track_save(d):
-    with _track_lock:
-        try:
-            with open(TRACK_FILE, "w") as f:
-                json.dump(d, f)
-        except Exception as e:
-            print("Track save failed:", e)
+    try:
+        with open(TRACK_FILE, "w") as f:
+            json.dump(d, f)
+    except Exception as e:
+        print("Track save failed:", e)
 
 def track_add(pair, tf, direction, entry, model, regime, features=None):
     tfi = max(1, int(tf))
@@ -719,9 +946,9 @@ def track_settle():
             "closed": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         try:
-            _edge_record(p.get("model"), p.get("regime"), bool(win))
-        except Exception:
-            pass
+            _ml_learn(pair, p.get("features"), p.get("dir"), bool(win))
+        except Exception as e:
+            print("ML feedback skipped:", e)
         print(f"Settled {p['dir']} {pair} entry={entry} exit={px} "
               f"-> {'WIN' if win else 'LOSS'}")
     d["settled"] = d["settled"][-200:]
@@ -742,59 +969,6 @@ def track_text():
     if not n:
         return "building (0 signals settled yet)"
     return f"{w}W / {l}L \u00b7 {pct:.0f}% (last {n})"
-
-
-# ===== edge statistics: real win rate per (model, regime) =====
-EDGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "edge_stats.json")
-
-
-def _edge_load():
-    try:
-        with open(EDGE_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            return d
-    except Exception:
-        pass
-    return {}
-
-
-def _edge_save(d):
-    try:
-        with open(EDGE_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception:
-        pass
-
-
-def _edge_key(model, regime):
-    return f"{model}|{regime}"
-
-
-def _edge_record(model, regime, win):
-    if not model:
-        return
-    d = _edge_load()
-    key = _edge_key(model, regime)
-    rec = d.get(key, {"w": 0, "l": 0})
-    if win:
-        rec["w"] = int(rec.get("w", 0)) + 1
-    else:
-        rec["l"] = int(rec.get("l", 0)) + 1
-    d[key] = rec
-    _edge_save(d)
-
-
-def edge_perf(model, regime):
-    """Win rate for a (model, regime) combination. Returns (w, l, pct, n)."""
-    if not model:
-        return 0, 0, None, 0
-    d = _edge_load()
-    rec = d.get(_edge_key(model, regime), {})
-    w = int(rec.get("w", 0))
-    l = int(rec.get("l", 0))
-    n = w + l
-    return w, l, (w / n * 100.0) if n else None, n
 
 
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
@@ -874,7 +1048,7 @@ def sync_account_trades():
     if not trades:
         return
     try:
-        d = {"seen_deals": []}
+        d = _ml_data_load()
     except Exception:
         return
     seen = set(str(x) for x in (d.get("seen_deals") or []))
@@ -903,7 +1077,8 @@ def sync_account_trades():
             direction = "CALL" if went_up else "PUT"
         else:
             direction = "PUT" if went_up else "CALL"
-        _edge_record(t["asset"], "account", bool(t["win"]))
+        feats = _feat_from_candles(raw_cache.get(t["asset"]) or [], t["open_ts"])
+        _ml_learn(t["asset"], feats, direction, bool(t["win"]))
         track["settled"].append({
             "pair": t["asset"], "tf": t["tf"], "dir": direction,
             "entry": t["entry"], "exit": t["exit"], "win": bool(t["win"]),
@@ -916,7 +1091,7 @@ def sync_account_trades():
     if changed:
         seen.update(new_seen)
         d["seen_deals"] = sorted(seen)[-500:]
-        _edge_save(d)
+        _ml_data_save(d)
         track["settled"] = track["settled"][-200:]
         track_save(track)
 
@@ -1281,16 +1456,31 @@ def now_hm():
     return time.strftime("%I:%M %p").lstrip("0")
 
 # ===== Spike screens =====
-def screen_head(title):
-    return f"\U0001f7e2 {title}\n\n"
+def screen_head(title, step):
+    dots = "".join(("\U0001f7e6" if i < step else "\u2b1b") for i in range(4))
+    return f"\U0001f7e2 Spike\n\n<b>{title}</b>\n\n{dots}\n"
 
 def kb_menu():
-    return [[{"text": "Start", "callback_data": "ui:market"}]]
+    return [[{"text": "Start", "callback_data": "ui:model"}]]
+
+def kb_model():
+    rows = []
+    for i in range(0, len(MODELS), 2):
+        chunk = MODELS[i:i + 2]
+        rows.append([{"text": _model_btn(k), "callback_data": f"mdl:{k}"} for k in chunk])
+    rows.append([{"text": "Back to Menu", "callback_data": "ui:menu"}])
+    return rows
+
+def _model_btn(key):
+    pct, n = model_perf(key)
+    if pct is None or n < 3:
+        return MODEL_NAMES[key]
+    return f"{MODEL_NAMES[key]} {pct:.0f}%"
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
              {"text": "OTC", "callback_data": "mkt:otc"}],
-            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+            [{"text": "Back to Model", "callback_data": "ui:model"}]]
 
 def kb_pairs(page, pairs, per=8):
     pages = max(1, (len(pairs) + per - 1) // per)
@@ -1303,7 +1493,7 @@ def kb_pairs(page, pairs, per=8):
            {"text": f"{page + 1}/{pages}", "callback_data": f"pg:{page}"},
            {"text": "\u25b6", "callback_data": f"pg:{min(pages - 1, page + 1)}"}]
     rows.append(nav)
-    rows.append([{"text": "Back", "callback_data": "ui:market"}])
+    rows.append([{"text": "Back to Market", "callback_data": "ui:market"}])
     return rows
 
 def kb_times():
@@ -1314,12 +1504,8 @@ def kb_times():
     return rows
 
 def kb_signal():
-    return [[{"text": "Get a signal", "callback_data": "sig:again"}],
-            [{"text": "Change settings", "callback_data": "ui:settings"}]]
-
-def kb_signal_retry():
-    return [[{"text": "Retry", "callback_data": "sig:again"}],
-            [{"text": "Change settings", "callback_data": "ui:settings"}]]
+    return [[{"text": "Request another signal", "callback_data": "sig:again"}],
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1418,13 +1604,34 @@ def tech_metrics(closes, ohlc, res):
 def card_caption(res, m, conf, pair, tf_txt):
     buy = res["signal"] == "CALL"
     word = "BUY" if buy else "SELL"
+    arrow = "\u25b2" if buy else "\u25bc"
     mkt = "OTC" if pair.endswith("-OTC") else "Stock"
     dec = 3 if "JPY" in pair else 5
     def price(v):
         return f"{v:.{dec}f}" if v is not None else "n/a"
+    news_s = res.get("news_sentiment", 0.0)
+    social_s = res.get("social_sentiment", 0.0)
     regime = res.get("regime", "normal")
+    mkey = str(globals().get("sel_model") or "solari")
+    learn_parts = []
+    mmeta = _ml_meta.get(f"{pair}#{mkey}") or {}
+    if mmeta.get("acc"):
+        learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
+    learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)}: "
+                  f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
+    win_lines = []
+    aw, al, apct, an = account_perf()
+    if an >= 1:
+        win_lines.append(f"\U0001f3c6 Account: <b>{aw}W / {al}L</b> "
+                         f"(<b>{apct:.0f}%</b> win \u00b7 real trades)")
+    lpct, ln = model_perf(mkey)
+    if ln >= 1:
+        w = int(round(lpct / 100.0 * ln))
+        win_lines.append(f"\U0001f4c8 Signals: <b>{w}W / {ln - w}L</b> "
+                         f"(<b>{lpct:.0f}%</b> \u00b7 last {ln})")
+    win_line = ("\n".join(win_lines) + "\n\n") if win_lines else ""
     return (
-        f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word}\n\n"
+        f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
         f"\U0001fab6 Market info:\n"
         f"\u2022 Volatility: <b>{m['vol']}</b>\n"
         f"\u2022 Asset strength by volume: <b>{m['asset_strength']:.0f}%</b>\n"
@@ -1437,6 +1644,13 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
         f"\u2022 MACD: <b>{m['macd']}</b>\n"
         f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
+        f"\U0001f4e6 Signal strength:\n"
+        f"\u2022 Strength: <b>{m['strength_label']} ({conf:.0f}%)</b> "
+        f"\u00b7 {m.get('n_signals', 0)} past signals checked\n"
+        f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
+        f"\u2022 Regime: <b>{regime}</b>\n\n"
+        f"{learn_line}"
+        f"{win_line}"
         f"{now_hm()}"
     )
 
@@ -1480,7 +1694,8 @@ def gen_text(pct, values):
 HELP_TEXT = (
     "/start - Main menu\n"
     "/stop - Stop all signals\n"
-    "Flow: Start -> Select market -> Select pair -> Select time -> Get a signal\n"
+    "Flow: Start -> Select AI Model -> Select a market (Stock/OTC) -> "
+    "Select a currency pair -> Select trading time -> signal\n"
     "No orders are placed - signals are display only."
 )
 
@@ -1500,6 +1715,8 @@ if __name__ == "__main__":
     acct_tick = 0.0
     last_page = 0
     warm_feed(sel_pair, sel_time, wait=20.0)
+    _ml_load()
+    ml_train_async(sel_pair, sel_time)
 
     WATCH_REFRESH = 15
     WATCH_ALERT_GAP = 120
@@ -1532,14 +1749,28 @@ if __name__ == "__main__":
 
     def persist():
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
-                       "market": sel_market})
+                       "model": sel_model, "market": sel_market})
 
     def send_menu(chat):
-        send(f"{screen_head('Market')}\nSELECT · MARKET TYPE\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market.",
-             chat_id=chat, keyboard=kb_market(), html_on=True)
+        send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
+             f"Real live market data. No orders are placed.",
+             chat_id=chat, keyboard=kb_menu(), html_on=True)
+
+    def send_model_screen(chat, edit_mid=None):
+        label = MODEL_PARAMS.get(sel_model, {}).get("label", "")
+        pct, n = model_perf(sel_model)
+        stats = (f" \u00b7 <b>{pct:.0f}%</b> from {n} settled signals"
+                 if pct is not None and n >= 3 else " \u00b7 learning")
+        text = (f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>\n\n"
+                f"\U0001f9e0 {MODEL_NAMES.get(sel_model, sel_model)}: {label}{stats}")
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_model()}})
+        else:
+            send(text, chat_id=chat, keyboard=kb_model(), html_on=True)
 
     def send_market_screen(chat, edit_mid=None):
-        text = f"{screen_head('Market')}\nSELECT · MARKET TYPE\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market."
+        text = f"{screen_head('Market', 2)}\nSelect a market:  <i>{now_hm()}</i>"
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_market()}})
@@ -1548,9 +1779,9 @@ if __name__ == "__main__":
 
     def send_pair_screen(chat, page=0, edit_mid=None):
         pairs = market_pairs(sel_market)
-        text = f"{screen_head('Pair')}\nSELECT · CURRENCY PAIR |\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market."
+        text = f"{screen_head('Pair', 3)}\nSelect a currency pair:  <i>{now_hm()}</i>"
         if not pairs:
-            text = f"{screen_head('Pair')}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
+            text = f"{screen_head('Pair', 3)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
             keyboard = kb_market()
         else:
             pages = max(1, (len(pairs) + 7) // 8)
@@ -1565,28 +1796,12 @@ if __name__ == "__main__":
             send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_time_screen(chat, edit_mid=None):
-        text = f"{screen_head('Time')}\nSELECT · TRADING TIME\n\nChoose the trading time that suits you most.\nThe lower the time value, the less accurate the bot's forecast will be."
+        text = f"{screen_head('Time', 4)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_times()}})
         else:
             send(text, chat_id=chat, keyboard=kb_times(), html_on=True)
-
-    def send_settings_screen(chat, edit_mid=None):
-        market_name = "Stock" if sel_market == "stock" else "OTC"
-        tf_txt = tf_label(sel_time)
-        text = (f"{screen_head('Workspace')}\n"
-                f"CATEGORY  CURRENCIES\n"
-                f"PAIR  {fmt_pair(sel_pair)} {market_name}\n"
-                f"T. TIME  {tf_txt}\n\n"
-                f"OFF-X AI")
-        keyboard = [[{"text": "Get a signal", "callback_data": "sig:again"}],
-                    [{"text": "Change settings", "callback_data": "ui:market"}]]
-        if edit_mid:
-            edit(text, chat, edit_mid, html_on=True)
-            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": keyboard}})
-        else:
-            send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_result(res, chat, m, conf, closes):
         pair_txt = fmt_pair(sel_pair)
@@ -1607,7 +1822,7 @@ if __name__ == "__main__":
         return send_card(chat, res, m, conf, closes)
 
     def run_generation(chat):
-        global CURRENT_MODEL, sel_model
+        global CURRENT_MODEL
         CURRENT_MODEL = sel_model
         mid = send(gen_text(0, []), chat_id=chat)
         values = []
@@ -1617,43 +1832,40 @@ if __name__ == "__main__":
                 edit(gen_text(pct, values), chat, mid)
             time.sleep(0.4)
 
-        try:
-            closes, note = get_series(sel_pair, sel_time, fetch=True)
-            res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
-            res["demo"] = bool(note)
-            ohlc = fetch_ohlc(sel_pair, sel_time)
-            m = tech_metrics(closes, ohlc, res)
-            conf = gate_score(res, sel_model)
+        closes, note = get_series(sel_pair, sel_time, fetch=True)
+        if pocket_payout is not None and DATA_SRC != "live stream":
+            if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
+                closes, note = get_series(sel_pair, sel_time, fetch=True)
+        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+        res["demo"] = bool(note)
+        ohlc = fetch_ohlc(sel_pair, sel_time)
+        m = tech_metrics(closes, ohlc, res)
+        conf = gate_score(res, sel_model)
 
-            params = MODEL_PARAMS[sel_model]
-            reveal_vals = [
-                f"{m['vol']} \u26a1",
-                (f"{m['rsi_label']} ({res['rsi']:.1f})" if res.get("rsi") is not None
-                 else m["rsi_label"]),
-                m["macd"],
-                m["ma"],
-                f"{m['asset_strength']:.0f}%",
-                f"{m['volume_result']:.0f}%",
-                f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
-                f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
-                f"{conf:.0f}% ({res.get('full_total', 0)} past signals)",
-            ]
-            for idx, val in enumerate(reveal_vals):
-                values.append(val)
-                reveal(GEN_PCT[idx])
-            time.sleep(0.4)
-            ok = send_result(res, chat, m, conf, closes)
-            if ok and res.get("signal") in ("CALL", "PUT"):
-                track_add(sel_pair, sel_time, res["signal"], m.get("price"),
-                          sel_model, res.get("regime"),
-                          features=_feat_last(closes))
-            return ok
-        except Exception as e:
-            print(f"run_generation failed: {type(e).__name__}: {e}")
-            import traceback
-            traceback.print_exc()
-            edit(f"❌ Signal generation failed: {type(e).__name__}. Check bot.log.", chat, mid, html_on=True)
-            return False
+        params = MODEL_PARAMS[sel_model]
+        reveal_vals = [
+            f"{m['vol']} \u26a1",
+            (f"{m['rsi_label']} ({res['rsi']:.1f})" if res.get("rsi") is not None
+             else m["rsi_label"]),
+            m["macd"],
+            m["ma"],
+            f"{m['asset_strength']:.0f}%",
+            f"{m['volume_result']:.0f}%",
+            f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
+            f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
+            f"{conf:.0f}% ({res.get('full_total', 0)} past signals)",
+        ]
+        for idx, val in enumerate(reveal_vals):
+            values.append(val)
+            reveal(GEN_PCT[idx])
+        time.sleep(0.4)
+        ok = send_result(res, chat, m, conf, closes)
+        if ok and res.get("signal") in ("CALL", "PUT"):
+            track_add(sel_pair, sel_time, res["signal"], m.get("price"),
+                      sel_model, res.get("regime"),
+                      features=_feat_last(closes))
+            ml_train_async(sel_pair, sel_time)
+        return ok
 
     _processed_cbs = set()
 
@@ -1675,13 +1887,23 @@ if __name__ == "__main__":
                 return
             answer(cb_id)
             if data == "ui:menu":
-                send_market_screen(chat)
+                send_menu(chat)
+            elif data == "ui:model":
+                mid = cb.get("message", {}).get("message_id")
+                send_model_screen(chat, edit_mid=mid)
+            elif data.startswith("mdl:"):
+                key = data.split(":", 1)[1]
+                if key in MODEL_PARAMS:
+                    sel_model = key
+                    globals()["CURRENT_MODEL"] = key
+                    persist()
+                    warm_feed(sel_pair, sel_time)
+                    ml_train_async(sel_pair, sel_time)
+                    mid = cb.get("message", {}).get("message_id")
+                    send_market_screen(chat, edit_mid=mid)
             elif data == "ui:market":
                 mid = cb.get("message", {}).get("message_id")
                 send_market_screen(chat, edit_mid=mid)
-            elif data == "ui:pairback":
-                mid = cb.get("message", {}).get("message_id")
-                send_pair_screen(chat, last_page, edit_mid=mid)
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
                 persist()
@@ -1698,17 +1920,20 @@ if __name__ == "__main__":
                 sel_pair = data.split(":", 1)[1]
                 persist()
                 warm_feed(sel_pair, sel_time)
+                ml_train_async(sel_pair, sel_time)
                 mid = cb.get("message", {}).get("message_id")
                 send_time_screen(chat, edit_mid=mid)
+            elif data == "ui:pairback":
+                mid = cb.get("message", {}).get("message_id")
+                send_pair_screen(chat, last_page, edit_mid=mid)
             elif data.startswith("tm:"):
                 try:
                     sel_time = int(data.split(":")[1])
                 except Exception:
                     sel_time = 60
                 persist()
-                warm_feed(sel_pair, sel_time, wait=3.0)
-                mid = cb.get("message", {}).get("message_id")
-                send_settings_screen(chat, edit_mid=mid)
+                warm_feed(sel_pair, sel_time)
+                run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
             elif data == "w:stop":
@@ -1739,9 +1964,7 @@ if __name__ == "__main__":
                 stop_watch(chat)
             send("All signals stopped.", chat_id=chat)
         elif cmd in ("/help", "help"):
-            send("Commands:\n/start - Main menu\n/stop - Stop all signals\n"
-                 "Flow: Start -> Select market -> Select pair -> Select time -> Get a signal\n"
-                 "No orders are placed - signals are display only.", chat_id=chat)
+            send("Commands:\n/start - Main menu\n/stop - Stop all signals", chat_id=chat)
 
     import queue as _queue
     update_q = _queue.Queue()
@@ -1760,16 +1983,6 @@ if __name__ == "__main__":
                 time.sleep(0.2)
 
     threading.Thread(target=_poll_worker, daemon=True).start()
-
-    def _settle_worker():
-        while True:
-            try:
-                track_settle()
-            except Exception:
-                pass
-            time.sleep(5)
-
-    threading.Thread(target=_settle_worker, daemon=True).start()
 
     while True:
         while True:
@@ -1823,7 +2036,7 @@ if __name__ == "__main__":
                     last_state[key] = time.time()
                     ohlc = fetch_ohlc(sel_pair, sel_time)
                     m = tech_metrics(closes, ohlc, res)
-                    send_card(owner_id, res, m, gate_score(res, sel_model), closes)
+                    send_card(owner_id, res, m, gate_score(res), closes)
                     track_add(sel_pair, sel_time, res["signal"], m.get("price"),
                               sel_model, res.get("regime"),
                               features=_feat_last(closes))
@@ -1835,5 +2048,10 @@ if __name__ == "__main__":
                 sync_account_trades()
             except Exception as e:
                 print("account sync failed:", e)
+
+        try:
+            track_settle()
+        except Exception:
+            pass
 
         time.sleep(1)
