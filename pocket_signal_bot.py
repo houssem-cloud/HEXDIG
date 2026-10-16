@@ -797,67 +797,6 @@ def edge_perf(model, regime):
     return w, l, (w / n * 100.0) if n else None, n
 
 
-# ===== Thompson bandit: pick the best model per regime =====
-BANDIT_ENABLED = True
-BANDIT_MIN_SAMPLES = 5
-BANDIT_DECAY_EVERY = 100
-BANDIT_DECAY_FACTOR = 0.6
-
-
-def bandit_sample(model, regime):
-    """Thompson sample from Beta(wins+1, losses+1) for a model/regime arm."""
-    if not model:
-        return 0.5
-    w, l, pct, n = edge_perf(model, regime)
-    if n < BANDIT_MIN_SAMPLES:
-        return random.betavariate(1, 1)
-    return random.betavariate(w + 1, l + 1)
-
-
-def bandit_decay(d):
-    n_total = int(d.get("_n_total", 0))
-    if n_total and n_total % BANDIT_DECAY_EVERY == 0:
-        for key, rec in list(d.items()):
-            if key.startswith("_") or not isinstance(rec, dict):
-                continue
-            rec["w"] = max(1, int(rec.get("w", 0) * BANDIT_DECAY_FACTOR))
-            rec["l"] = max(1, int(rec.get("l", 0) * BANDIT_DECAY_FACTOR))
-
-
-def _edge_record(model, regime, win):
-    if not model:
-        return
-    d = _edge_load()
-    d["_n_total"] = int(d.get("_n_total", 0)) + 1
-    bandit_decay(d)
-    key = _edge_key(model, regime)
-    rec = d.get(key, {"w": 0, "l": 0})
-    if win:
-        rec["w"] = int(rec.get("w", 0)) + 1
-    else:
-        rec["l"] = int(rec.get("l", 0)) + 1
-    d[key] = rec
-    _edge_save(d)
-
-
-def bandit_select(candidates):
-    """candidates: list of (model_key, res_dict). Thompson-sample each arm's
-    historical win-rate in its regime; return the model with the highest sample."""
-    if not candidates:
-        return None, None
-    if not BANDIT_ENABLED or len(candidates) == 1:
-        return candidates[0]
-    best = None
-    best_s = -1.0
-    for m, r in candidates:
-        reg = r.get("regime", "normal")
-        s = bandit_sample(m, reg)
-        if s > best_s:
-            best_s = s
-            best = (m, r)
-    return best
-
-
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
 ACCT_SYNC_GAP = 45.0
 
@@ -1342,31 +1281,16 @@ def now_hm():
     return time.strftime("%I:%M %p").lstrip("0")
 
 # ===== Spike screens =====
-def screen_head(title, step):
-    dots = "".join(("\U0001f7e6" if i < step else "\u2b1b") for i in range(4))
-    return f"\U0001f7e2 Spike\n\n<b>{title}</b>\n\n{dots}\n"
+def screen_head(title):
+    return f"\U0001f7e2 {title}\n\n"
 
 def kb_menu():
-    return [[{"text": "Start", "callback_data": "ui:model"}]]
-
-def kb_model():
-    rows = []
-    for i in range(0, len(MODELS), 2):
-        chunk = MODELS[i:i + 2]
-        rows.append([{"text": _model_btn(k), "callback_data": f"mdl:{k}"} for k in chunk])
-    rows.append([{"text": "Back to Menu", "callback_data": "ui:menu"}])
-    return rows
-
-def _model_btn(key):
-    pct, n = model_perf(key)
-    if pct is None or n < 3:
-        return MODEL_NAMES[key]
-    return f"{MODEL_NAMES[key]} {pct:.0f}%"
+    return [[{"text": "Start", "callback_data": "ui:market"}]]
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
              {"text": "OTC", "callback_data": "mkt:otc"}],
-            [{"text": "Back to Model", "callback_data": "ui:model"}]]
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 def kb_pairs(page, pairs, per=8):
     pages = max(1, (len(pairs) + per - 1) // per)
@@ -1379,7 +1303,7 @@ def kb_pairs(page, pairs, per=8):
            {"text": f"{page + 1}/{pages}", "callback_data": f"pg:{page}"},
            {"text": "\u25b6", "callback_data": f"pg:{min(pages - 1, page + 1)}"}]
     rows.append(nav)
-    rows.append([{"text": "Back to Market", "callback_data": "ui:market"}])
+    rows.append([{"text": "Back", "callback_data": "ui:market"}])
     return rows
 
 def kb_times():
@@ -1390,8 +1314,12 @@ def kb_times():
     return rows
 
 def kb_signal():
-    return [[{"text": "Request another signal", "callback_data": "sig:again"}],
-            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+    return [[{"text": "Get a signal", "callback_data": "sig:again"}],
+            [{"text": "Change settings", "callback_data": "ui:settings"}]]
+
+def kb_signal_retry():
+    return [[{"text": "Retry", "callback_data": "sig:again"}],
+            [{"text": "Change settings", "callback_data": "ui:settings"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1490,32 +1418,13 @@ def tech_metrics(closes, ohlc, res):
 def card_caption(res, m, conf, pair, tf_txt):
     buy = res["signal"] == "CALL"
     word = "BUY" if buy else "SELL"
-    arrow = "\u25b2" if buy else "\u25bc"
     mkt = "OTC" if pair.endswith("-OTC") else "Stock"
     dec = 3 if "JPY" in pair else 5
     def price(v):
         return f"{v:.{dec}f}" if v is not None else "n/a"
-    news_s = res.get("news_sentiment", 0.0)
-    social_s = res.get("social_sentiment", 0.0)
     regime = res.get("regime", "normal")
-    mkey = str(globals().get("sel_model") or "solari")
-    ew, el, epct, en = edge_perf(mkey, regime)
-    edge_line = ""
-    if en >= 10:
-        edge_line = f"\U0001f4ca Edge: {epct:.0f}% ({en} signals)\n\n"
-    win_lines = []
-    aw, al, apct, an = account_perf()
-    if an >= 1:
-        win_lines.append(f"\U0001f3c6 Account: <b>{aw}W / {al}L</b> "
-                         f"(<b>{apct:.0f}%</b> win \u00b7 real trades)")
-    lpct, ln = model_perf(mkey)
-    if ln >= 1:
-        w = int(round(lpct / 100.0 * ln))
-        win_lines.append(f"\U0001f4c8 Signals: <b>{w}W / {ln - w}L</b> "
-                         f"(<b>{lpct:.0f}%</b> \u00b7 last {ln})")
-    win_line = ("\n".join(win_lines) + "\n\n") if win_lines else ""
     return (
-        f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
+        f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word}\n\n"
         f"\U0001fab6 Market info:\n"
         f"\u2022 Volatility: <b>{m['vol']}</b>\n"
         f"\u2022 Asset strength by volume: <b>{m['asset_strength']:.0f}%</b>\n"
@@ -1528,13 +1437,6 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
         f"\u2022 MACD: <b>{m['macd']}</b>\n"
         f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
-        f"\U0001f4e6 Signal strength:\n"
-        f"\u2022 Strength: <b>{m['strength_label']} ({conf:.0f}%)</b> "
-        f"\u00b7 {m.get('n_signals', 0)} past signals checked\n"
-        f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
-        f"\u2022 Regime: <b>{regime}</b>\n\n"
-        f"{edge_line}"
-        f"{win_line}"
         f"{now_hm()}"
     )
 
@@ -1578,8 +1480,7 @@ def gen_text(pct, values):
 HELP_TEXT = (
     "/start - Main menu\n"
     "/stop - Stop all signals\n"
-    "Flow: Start -> Select AI Model -> Select a market (Stock/OTC) -> "
-    "Select a currency pair -> Select trading time -> signal\n"
+    "Flow: Start -> Select market -> Select pair -> Select time -> Get a signal\n"
     "No orders are placed - signals are display only."
 )
 
@@ -1590,7 +1491,6 @@ if __name__ == "__main__":
     sel_market = str(S.get("market") or "otc")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
-    bandit_enabled = bool(S.get("bandit", True))
     auto_on = False
     CURRENT_MODEL = sel_model
     update_offset = None
@@ -1632,29 +1532,14 @@ if __name__ == "__main__":
 
     def persist():
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
-                       "model": sel_model, "market": sel_market,
-                       "bandit": bandit_enabled})
+                       "market": sel_market})
 
     def send_menu(chat):
-        send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
-             f"Real live market data. No orders are placed.",
-             chat_id=chat, keyboard=kb_menu(), html_on=True)
-
-    def send_model_screen(chat, edit_mid=None):
-        label = MODEL_PARAMS.get(sel_model, {}).get("label", "")
-        pct, n = model_perf(sel_model)
-        stats = (f" \u00b7 <b>{pct:.0f}%</b> from {n} settled signals"
-                 if pct is not None and n >= 3 else " \u00b7 learning")
-        text = (f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>\n\n"
-                f"\U0001f9e0 {MODEL_NAMES.get(sel_model, sel_model)}: {label}{stats}")
-        if edit_mid:
-            edit(text, chat, edit_mid, html_on=True)
-            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_model()}})
-        else:
-            send(text, chat_id=chat, keyboard=kb_model(), html_on=True)
+        send(f"{screen_head('Market')}\nSELECT · MARKET TYPE\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market.",
+             chat_id=chat, keyboard=kb_market(), html_on=True)
 
     def send_market_screen(chat, edit_mid=None):
-        text = f"{screen_head('Market', 2)}\nSelect a market:  <i>{now_hm()}</i>"
+        text = f"{screen_head('Market')}\nSELECT · MARKET TYPE\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market."
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_market()}})
@@ -1663,9 +1548,9 @@ if __name__ == "__main__":
 
     def send_pair_screen(chat, page=0, edit_mid=None):
         pairs = market_pairs(sel_market)
-        text = f"{screen_head('Pair', 3)}\nSelect a currency pair:  <i>{now_hm()}</i>"
+        text = f"{screen_head('Pair')}\nSELECT · CURRENCY PAIR |\n\nIf the stock market is closed at this time, you will automatically switch to the OTC market."
         if not pairs:
-            text = f"{screen_head('Pair', 3)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
+            text = f"{screen_head('Pair')}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
             keyboard = kb_market()
         else:
             pages = max(1, (len(pairs) + 7) // 8)
@@ -1680,12 +1565,28 @@ if __name__ == "__main__":
             send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_time_screen(chat, edit_mid=None):
-        text = f"{screen_head('Time', 4)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
+        text = f"{screen_head('Time')}\nSELECT · TRADING TIME\n\nChoose the trading time that suits you most.\nThe lower the time value, the less accurate the bot's forecast will be."
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_times()}})
         else:
             send(text, chat_id=chat, keyboard=kb_times(), html_on=True)
+
+    def send_settings_screen(chat, edit_mid=None):
+        market_name = "Stock" if sel_market == "stock" else "OTC"
+        tf_txt = tf_label(sel_time)
+        text = (f"{screen_head('Workspace')}\n"
+                f"CATEGORY  CURRENCIES\n"
+                f"PAIR  {fmt_pair(sel_pair)} {market_name}\n"
+                f"T. TIME  {tf_txt}\n\n"
+                f"OFF-X AI")
+        keyboard = [[{"text": "Get a signal", "callback_data": "sig:again"}],
+                    [{"text": "Change settings", "callback_data": "ui:market"}]]
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": keyboard}})
+        else:
+            send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_result(res, chat, m, conf, closes):
         pair_txt = fmt_pair(sel_pair)
@@ -1703,7 +1604,28 @@ if __name__ == "__main__":
                  f"a few seconds - a signal is always given once the data is ready.",
                  chat_id=chat, keyboard=kb_signal(), html_on=True)
             return False
-        return send_card(chat, res, m, conf, closes)
+        buy = res["signal"] == "CALL"
+        word = "BUY" if buy else "SELL"
+        # BIG LOWER/HIGHER style
+        big_word = "BUY" if buy else "SELL"
+        mkt = "OTC" if pair.endswith("-OTC") else "Stock"
+        text = (f"{screen_head(f'{mkt} MARKET')}\n"
+                f"{'BUY' if buy else 'SELL'}\n\n"
+                f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word}\n\n"
+                f"\U0001fab6 Market info:\n"
+                f"\u2022 Volatility: <b>{m['vol']}</b>\n"
+                f"\u2022 Asset strength by volume: <b>{m['asset_strength']:.0f}%</b>\n"
+                f"\u2022 Volume result: <b>{m['volume_result']:.0f}%</b>\n"
+                f"\u2022 Sentiment: <b>{m['sentiment']}</b>\n\n"
+                f"\U0001f9ed Technical overview:\n"
+                f"\u2022 Current price: <b>{price(m['price'])} {mkt}</b>\n"
+                f"\u2022 Resistance (R1): <b>{price(m['r1'])}</b>\n"
+                f"\u2022 Support (S1): <b>{price(m['s1'])}</b>\n"
+                f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
+                f"\u2022 MACD: <b>{m['macd']}</b>\n"
+                f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
+                f"{now_hm()}")
+        return send(text, chat_id=chat, keyboard=kb_signal_retry(), html_on=True)
 
     def run_generation(chat):
         global CURRENT_MODEL, sel_model
@@ -1757,7 +1679,7 @@ if __name__ == "__main__":
     _processed_cbs = set()
 
     def handle_update(upd):
-        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page, bandit_enabled
+        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id", "")
@@ -1774,22 +1696,13 @@ if __name__ == "__main__":
                 return
             answer(cb_id)
             if data == "ui:menu":
-                send_menu(chat)
-            elif data == "ui:model":
-                mid = cb.get("message", {}).get("message_id")
-                send_model_screen(chat, edit_mid=mid)
-            elif data.startswith("mdl:"):
-                key = data.split(":", 1)[1]
-                if key in MODEL_PARAMS:
-                    sel_model = key
-                    globals()["CURRENT_MODEL"] = key
-                    persist()
-                    warm_feed(sel_pair, sel_time)
-                    mid = cb.get("message", {}).get("message_id")
-                    send_market_screen(chat, edit_mid=mid)
+                send_market_screen(chat)
             elif data == "ui:market":
                 mid = cb.get("message", {}).get("message_id")
                 send_market_screen(chat, edit_mid=mid)
+            elif data == "ui:pairback":
+                mid = cb.get("message", {}).get("message_id")
+                send_pair_screen(chat, last_page, edit_mid=mid)
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
                 persist()
@@ -1808,9 +1721,6 @@ if __name__ == "__main__":
                 warm_feed(sel_pair, sel_time)
                 mid = cb.get("message", {}).get("message_id")
                 send_time_screen(chat, edit_mid=mid)
-            elif data == "ui:pairback":
-                mid = cb.get("message", {}).get("message_id")
-                send_pair_screen(chat, last_page, edit_mid=mid)
             elif data.startswith("tm:"):
                 try:
                     sel_time = int(data.split(":")[1])
@@ -1818,7 +1728,8 @@ if __name__ == "__main__":
                     sel_time = 60
                 persist()
                 warm_feed(sel_pair, sel_time, wait=3.0)
-                run_generation(chat)
+                mid = cb.get("message", {}).get("message_id")
+                send_settings_screen(chat, edit_mid=mid)
             elif data == "sig:again":
                 run_generation(chat)
             elif data == "w:stop":
@@ -1850,11 +1761,8 @@ if __name__ == "__main__":
             send("All signals stopped.", chat_id=chat)
         elif cmd in ("/help", "help"):
             send("Commands:\n/start - Main menu\n/stop - Stop all signals\n"
-                 "/bandit - toggle model bandit on/off", chat_id=chat)
-        elif cmd in ("/bandit", "bandit"):
-            bandit_enabled = not bandit_enabled
-            persist()
-            send(f"Model bandit: <b>{'ON' if bandit_enabled else 'OFF'}</b>", chat_id=chat, html_on=True)
+                 "Flow: Start -> Select market -> Select pair -> Select time -> Get a signal\n"
+                 "No orders are placed - signals are display only.", chat_id=chat)
 
     import queue as _queue
     update_q = _queue.Queue()
@@ -1929,24 +1837,7 @@ if __name__ == "__main__":
             closes, note = get_series(sel_pair, sel_time, fetch=True)
             if note or not closes:
                 continue
-            res = None
-            if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
-                candidates = []
-                for m in MODELS:
-                    try:
-                        r = analyze(closes, m)
-                        if r.get("signal") in ("CALL", "PUT") and r.get("setup"):
-                            candidates.append((m, r))
-                    except Exception:
-                        continue
-                if candidates:
-                    bm, br = bandit_select(candidates)
-                    if bm:
-                        sel_model = bm
-                        res = br
-                        res["bandit_model"] = bm
-            if res is None:
-                res = analyze(closes, sel_model)
+            res = analyze(closes, sel_model)
             if res["signal"] in ("CALL", "PUT") and res.get("setup"):
                 key = f"{sel_pair}#{sel_time}#{sel_model}"
                 if time.time() - last_state.get(key, 0) >= COOLDOWN_SEC:
