@@ -33,6 +33,9 @@ import pandas as pd
 import numpy as np
 from collections import deque
 
+# ===== thread safety for shared track file =====
+_track_lock = threading.RLock()
+
 # ===== NEWS & SENTIMENT =====
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 SOCIAL_SENTIMENT_WEIGHT = 0.3
@@ -600,23 +603,26 @@ TRACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "signal_track.json")
 
 def track_load():
-    try:
-        with open(TRACK_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            d.setdefault("pending", [])
-            d.setdefault("settled", [])
-            return d
-    except Exception:
-        pass
-    return {"pending": [], "settled": []}
+    with _track_lock:
+        try:
+            with open(TRACK_FILE) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                d.setdefault("pending", [])
+                d.setdefault("settled", [])
+                return d
+        except Exception:
+            pass
+        return {"pending": [], "settled": []}
+
 
 def track_save(d):
-    try:
-        with open(TRACK_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception as e:
-        print("Track save failed:", e)
+    with _track_lock:
+        try:
+            with open(TRACK_FILE, "w") as f:
+                json.dump(d, f)
+        except Exception as e:
+            print("Track save failed:", e)
 
 def track_add(pair, tf, direction, entry, model, regime, features=None):
     tfi = max(1, int(tf))
@@ -1868,6 +1874,16 @@ if __name__ == "__main__":
 
     threading.Thread(target=_poll_worker, daemon=True).start()
 
+    def _settle_worker():
+        while True:
+            try:
+                track_settle()
+            except Exception:
+                pass
+            time.sleep(5)
+
+    threading.Thread(target=_settle_worker, daemon=True).start()
+
     while True:
         while True:
             try:
@@ -1949,10 +1965,5 @@ if __name__ == "__main__":
                 sync_account_trades()
             except Exception as e:
                 print("account sync failed:", e)
-
-        try:
-            track_settle()
-        except Exception:
-            pass
 
         time.sleep(1)
