@@ -18,6 +18,7 @@ support/resistance levels, volume analysis, and multi-factor confidence scoring.
 No orders, no balance, no auto-trading - display only.
 
 Run: pip install pandas numpy requests
+     set TELEGRAM_TOKEN (BotFather token) and TELEGRAM_CHAT_ID env vars
      python pocket_signal_bot.py
 """
 
@@ -97,8 +98,8 @@ class SentimentCache:
 sentiment_cache = SentimentCache()
 
 # ===== CONFIG =====
-TELEGRAM_TOKEN = "8864905024:AAFXqcmi7NmgnoLdE1t2mHiwXrOBOhtvywQ"
-CHAT_ID = "PASTE_CHAT_ID_NUMBER"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PASTE_CHAT_ID_NUMBER")
 
 PERIOD = 20
 STD_MULT = 2.0
@@ -106,7 +107,9 @@ COOLDOWN_SEC = 60
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "pocket_settings.json")
 
 RSI_PERIOD = 14
-HORIZON = 5
+# Target is exactly ONE bar of the selected timeframe, matching a binary
+# option bought now that expires `sel_time` seconds later.
+HORIZON = 1
 SQUEEZE_PCT = 40
 
 MODEL_PARAMS = {
@@ -189,7 +192,7 @@ def _indicator_stack(closes):
     # ADX
     plus_dm = s.diff().clip(lower=0)
     minus_dm = (-s.diff()).clip(lower=0)
-    tr = pd.concat([s - s.shift(1), s.rolling(1).max() - s.rolling(1).min()], axis=1).max(axis=1)
+    tr = s.diff().abs()
     atr = tr.rolling(14).mean()
     plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
     minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
@@ -254,12 +257,15 @@ def decide_at(stk, i, params):
 
 
 def _compute_volume(closes):
-    if not closes or len(closes) < 10:
+    """Scale-free volatility percentile (FX/OTC has no real volume)."""
+    if not closes or len(closes) < 30:
         return {"vol": "Normal", "vol_pct": 50.0}
-    s = pd.Series([float(x) for x in closes])
-    i = len(s) - 1
-    pct_change = s.pct_change().iloc[i] * 100 if not pd.isna(s.pct_change().iloc[i]) else 0
-    vol_pct = abs(pct_change)
+    ret = pd.Series([float(x) for x in closes]).pct_change().abs().dropna()
+    if len(ret) < 20:
+        return {"vol": "Normal", "vol_pct": 50.0}
+    window = ret.iloc[-100:]
+    cur = float(window.iloc[-1])
+    vol_pct = float((window < cur).mean() * 100.0)
     if vol_pct >= 75:
         vol_label = "High (breakout)"
     elif vol_pct >= 50:
@@ -271,9 +277,11 @@ def _compute_volume(closes):
     return {"vol": vol_label, "vol_pct": vol_pct}
 
 
-def analyze(closes, model=None, news_symbol=None):
+def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["solari"])
+    pair = pair or sel_pair_default()
+    period = int(period or 60)
     out = {"signal": "WAIT", "accuracy": 0.0, "note": "", "rsi": None,
            "up": None, "lo": None, "wide": False, "depth": 0.0, "model": model,
            "setup": False, "regime": "normal", "horizon": HORIZON,
@@ -329,6 +337,7 @@ def analyze(closes, model=None, news_symbol=None):
 
     vol_data = _compute_volume(closes)
     out["volume"] = vol_data["vol"]
+    out["vol_pct"] = vol_data["vol_pct"]
     out["confidence_factors"]["volume"] = vol_data["vol_pct"]
 
     price = float(stk["s"].iloc[i])
@@ -341,21 +350,16 @@ def analyze(closes, model=None, news_symbol=None):
         out["confidence_factors"]["in_upper"] = pos >= 70
         out["confidence_factors"]["in_lower"] = pos <= 30
 
-    conf_base = gate_score(out, model)
-    sentiment_weight = 0.2
-    conf_adjusted = conf_base * (1 + sentiment_weight * news_s) if news_s else conf_base
-    regime_factor = 1.0 if out["regime"] == "squeeze" else (1.1 if out["regime"] == "normal" else 0.9)
-
-    ml_score = _ml_predict(closes, model=model)
+    ml_score = _ml_predict(closes, model=model, pair=pair)
     out["ml_score"] = ml_score
     out["confidence_factors"]["ml"] = ml_score
 
-    ohlc_data = fetch_ohlc(sel_pair_default(), 60) if pocket_payout else None
+    ohlc_data = fetch_ohlc(pair, period) if pocket_payout else None
     pa_score = _price_action_score(ohlc_data) if ohlc_data else 0.0
     out["price_action"] = pa_score
     out["confidence_factors"]["price_action"] = pa_score
 
-    tf_sig, tf_conf = _multi_tf_confluence(sel_pair_default(), 60)
+    tf_sig, tf_conf = _multi_tf_confluence(pair, period)
     out["tf_confluence"] = tf_conf
     out["confidence_factors"]["tf_confluence"] = tf_conf
 
@@ -368,7 +372,7 @@ def analyze(closes, model=None, news_symbol=None):
     out["optimized_acc"] = best_acc
     out["confidence_factors"]["backtest_mult"] = best_mult
 
-    conf_final = min(95.0, max(20.0, conf_adjusted * regime_factor * adaptive))
+    conf_final = min(95.0, max(20.0, gate_score(out, model)))
     out["confidence_factors"]["regime"] = out["regime"]
     out["confidence"] = conf_final
     out["signal"] = decide_at(stk, i, params) or "WAIT"
@@ -615,10 +619,10 @@ def ml_train_async(pair, tf=None, force=False):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _ml_predict(closes, model=None):
+def _ml_predict(closes, model=None, pair=None):
     """Real model probability score in [-1, 1]; learns on demand."""
     try:
-        pair = str(globals().get("sel_pair") or "EURUSD-OTC")
+        pair = str(pair or globals().get("sel_pair") or "EURUSD-OTC")
         key = str(model or globals().get("CURRENT_MODEL") or "solari")
         ck = f"{pair}#{key}"
         with _ml_lock:
@@ -1177,7 +1181,7 @@ def market_report(pair, period_sec, fetch=True):
     if not pats:
         pats.append("no clear pattern on the last candle")
 
-    setup = analyze(closes)
+    setup = analyze(closes, pair=pair, period=period_sec)
     return {"ok": True, "pair": pair, "period": period_sec, "trend": trend,
             "trend_note": tnote, "vol": vol, "vol_pct": vol_pct, "rsi": r_now,
             "rsi_dir": rsi_dir, "pos": pos, "pos_note": pos_note, "patterns": pats,
@@ -1294,7 +1298,7 @@ def api_call(method, payload):
 
 def send(text, chat_id=None, keyboard=None, html_on=False):
     target = chat_id or CHAT_ID
-    if TELEGRAM_TOKEN.startswith("PASTE"):
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN.startswith("PASTE"):
         print(f"[DRY] {text}")
         return None
     if isinstance(target, str) and target.startswith("PASTE"):
@@ -1367,6 +1371,9 @@ def header_image(pair, signal, closes):
 
 def send_photo(path, caption, chat_id=None, keyboard=None, html_on=False):
     target = chat_id or CHAT_ID
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN.startswith("PASTE"):
+        print(f"[DRY] (photo) {caption[:80]}")
+        return None
     if isinstance(target, str) and target.startswith("PASTE"):
         print(f"[WAIT FOR /start] (photo) {caption[:80]}")
         return None
@@ -1700,6 +1707,10 @@ HELP_TEXT = (
 )
 
 if __name__ == "__main__":
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_TOKEN is not set. Set the env var to your BotFather token,")
+        print('e.g. in PowerShell:  $env:TELEGRAM_TOKEN="<new token>"  then run again.')
+        raise SystemExit(1)
     print("Bot starting (SPIKE UI, live feed, on-demand signals)...")
     S = load_settings()
     sel_model = str(S.get("model") or "solari")
@@ -1836,7 +1847,8 @@ if __name__ == "__main__":
         if pocket_payout is not None and DATA_SRC != "live stream":
             if pocket_payout.start_live(sel_pair, sel_time, wait=8.0):
                 closes, note = get_series(sel_pair, sel_time, fetch=True)
-        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""))
+        res = analyze(closes, sel_model, news_symbol=sel_pair.replace("-OTC", ""),
+                      pair=sel_pair, period=sel_time)
         res["demo"] = bool(note)
         ohlc = fetch_ohlc(sel_pair, sel_time)
         m = tech_metrics(closes, ohlc, res)
@@ -2029,7 +2041,7 @@ if __name__ == "__main__":
             closes, note = get_series(sel_pair, sel_time, fetch=True)
             if note or not closes:
                 continue
-            res = analyze(closes, sel_model)
+            res = analyze(closes, sel_model, pair=sel_pair, period=sel_time)
             if res["signal"] in ("CALL", "PUT") and res.get("setup"):
                 key = f"{sel_pair}#{sel_time}#{sel_model}"
                 if time.time() - last_state.get(key, 0) >= COOLDOWN_SEC:
