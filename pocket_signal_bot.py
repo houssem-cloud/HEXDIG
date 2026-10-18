@@ -1,19 +1,16 @@
 """
-Spike-style Pocket Option SIGNAL bot - Model -> Market -> Pair -> Time -> Signal.
+Spike-style Pocket Option SIGNAL bot - Market -> Pair -> Time -> Signal.
 
-Flow:  /start  ->  Start  ->  Select AI Model  ->  Select a market (Stock/OTC)
+Flow:  /start  ->  Start  ->  Select a market (Stock/OTC)
        ->  Select a currency pair  ->  Select trading time
-       ->  Signal Generation...  ->  BUY/SELL card  ->  Request another signal
+       ->  Signal Generation...  ->  BUY/SELL or NO TRADE card
 
-Models (all unlocked): each is a REAL measured strategy variant - see
-MODEL_PARAMS rule_acc values (hold-out hit-rates on 50 real Pocket series).
-Data: live tick stream via SSID (pocket_payout.py) - the last bar is the
-CURRENT price. A BUY/SELL signal is ALWAYS shown (expert-bot style): the
-decision rule is replayed over this pair's own history and its measured
-next-bar hit-rate is displayed as the confidence.
-
-Enhanced with: news sentiment, social sentiment, ADX, Stochastic, Williams %R,
-support/resistance levels, volume analysis, and multi-factor confidence scoring.
+One signal engine: a transparent rule vote confirmed by a single classifier
+scored with rolling walk-forward validation. Data is the live tick stream via
+SSID (pocket_payout.py); the last bar is the CURRENT price. The decision rule
+is replayed over the pair's own history and its out-of-sample hit-rate is
+compared to the payout break-even. A BUY/SELL card is shown ONLY when that edge
+clears break-even; otherwise the bot says NO TRADE.
 
 No orders, no balance, no auto-trading - display only.
 
@@ -118,25 +115,16 @@ EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
 MIN_BACKTEST_N = 40    # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
 
+# Single engine: one transparent rule vote + one walk-forward-validated
+# classifier used as confirmation. The previous six "models" were cosmetic
+# weight variants with no measured edge, so they were removed.
+ENGINE_WEIGHTS = (2, 2, 1, 1)
 MODEL_PARAMS = {
-    "solari":     {"w": (2, 2, 1, 1), "squeeze_acc": 51.6, "normal_acc": 46.9,
-                   "label": "Random Forest - balanced vote"},
-    "lumina":     {"w": (1, 1, 1, 2), "squeeze_acc": 54.4, "normal_acc": 46.7,
-                   "label": "Gradient Boosting - quiet markets"},
-    "astraq":     {"w": (3, 1, 1, 1), "squeeze_acc": 48.9, "normal_acc": 46.7,
-                   "label": "Extra Trees - trend detection"},
-    "korra":      {"w": (1, 3, 1, 1), "squeeze_acc": 54.3, "normal_acc": 46.4,
-                   "label": "Online SGD - keeps learning live"},
-    "cognimatic": {"w": (1, 1, 3, 1), "squeeze_acc": 52.6, "normal_acc": 46.6,
-                   "label": "Logistic Regression - pattern weight"},
-    "neovision":  {"w": (2, 2, 2, 2), "squeeze_acc": 51.6, "normal_acc": 46.9,
-                   "label": "Deep Forest - heavy vote"},
+    "engine": {"w": ENGINE_WEIGHTS, "squeeze_acc": 50.0, "normal_acc": 50.0,
+               "label": "Rule vote + validated classifier"},
 }
-MODELS = ["solari", "lumina", "astraq", "korra", "cognimatic", "neovision"]
-MODEL_NAMES = {
-    "solari": "Solari 2.0", "lumina": "Lumina 3.9", "astraq": "AstraQ 2.2",
-    "korra": "Korra 2.4", "cognimatic": "Cognimatic 4.1", "neovision": "NeoVision 3.6",
-}
+MODELS = ["engine"]
+MODEL_NAMES = {"engine": "Engine"}
 
 TIMES = [(5, "5 seconds"), (15, "15 seconds"), (30, "30 seconds"), (60, "1 minutes"),
          (120, "2 minutes"), (180, "3 minutes"), (300, "5 minutes"), (600, "10 minutes")]
@@ -147,7 +135,7 @@ except Exception:
     pocket_payout = None
 
 DATA_SRC = "demo (random)"
-CURRENT_MODEL = "solari"
+CURRENT_MODEL = "engine"
 
 DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
                  "EURGBP", "EURJPY", "GBPJPY", "EURAUD", "EURCHF", "EURCAD", "GBPCHF",
@@ -158,7 +146,7 @@ DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZ
 # ===== settings persistence =====
 def load_settings():
     d = {"last_pair": "EURUSD-OTC", "last_time": 60, "auto": False,
-         "model": "solari", "market": "otc"}
+         "model": "engine", "market": "otc"}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:
@@ -166,7 +154,7 @@ def load_settings():
         except Exception:
             pass
     if d.get("model") not in MODEL_PARAMS:
-        d["model"] = "solari"
+        d["model"] = "engine"
     if d.get("market") not in ("stock", "otc"):
         d["market"] = "otc"
     return d
@@ -325,7 +313,7 @@ def _wilson_lower(wins, n, z=1.96):
 
 def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     model = model or CURRENT_MODEL
-    params = MODEL_PARAMS.get(model, MODEL_PARAMS["solari"])
+    params = MODEL_PARAMS.get(model, MODEL_PARAMS["engine"])
     pair = pair or sel_pair_default()
     period = int(period or 60)
     out = {"signal": "WAIT", "accuracy": 0.0, "note": "", "rsi": None,
@@ -588,33 +576,45 @@ def _ml_dataset(pair, closes):
     return xs, ys
 
 
-def _ml_estimator(key):
-    """Each menu model is a real, different algorithm."""
-    from sklearn.ensemble import (RandomForestClassifier,
-                                  GradientBoostingClassifier,
-                                  ExtraTreesClassifier)
-    from sklearn.linear_model import LogisticRegression, SGDClassifier
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-    if key == "lumina":
-        return GradientBoostingClassifier(n_estimators=120, max_depth=3,
-                                          learning_rate=0.08, subsample=0.8,
-                                          random_state=7)
-    if key == "astraq":
-        return ExtraTreesClassifier(n_estimators=150, max_depth=7,
-                                    random_state=11)
-    if key == "korra":
-        return make_pipeline(StandardScaler(),
-                             SGDClassifier(loss="log_loss", alpha=1e-3,
-                                           max_iter=1500, random_state=3))
-    if key == "cognimatic":
-        return make_pipeline(StandardScaler(),
-                             LogisticRegression(max_iter=800, C=0.5))
-    if key == "neovision":
-        return RandomForestClassifier(n_estimators=250, max_depth=8,
-                                      min_samples_leaf=5, random_state=21)
-    return RandomForestClassifier(n_estimators=150, max_depth=6,
-                                  random_state=42)
+def _ml_estimator(key=None):
+    """One regularised classifier, tuned for small noisy FX samples."""
+    from sklearn.ensemble import GradientBoostingClassifier
+    return GradientBoostingClassifier(n_estimators=120, max_depth=3,
+                                      learning_rate=0.05, subsample=0.8,
+                                      min_samples_leaf=20, random_state=7)
+
+
+def walk_forward_acc(closes, key=None, folds=4):
+    """Rolling-origin out-of-sample accuracy (%), the honest way to score a
+    classifier: train on the past, test on the next unseen slice, roll forward.
+    Returns (accuracy_pct, n_test) or (None, 0) when there is too little data."""
+    try:
+        X, y = _ml_dataset("__wf__", closes)
+        n = len(X)
+        step = n // (folds + 1)
+        if n < 120 or step < 20:
+            return None, 0
+        from sklearn.metrics import accuracy_score
+        accs, tested = [], 0
+        for f in range(1, folds + 1):
+            tr_end = step * f
+            te_end = min(n, step * (f + 1))
+            if te_end - tr_end < 5:
+                continue
+            Xtr, ytr = X[:tr_end], y[:tr_end]
+            Xte, yte = X[tr_end:te_end], y[tr_end:te_end]
+            if len(set(ytr)) < 2:
+                continue
+            clf = _ml_estimator(key)
+            clf.fit(Xtr, ytr)
+            accs.append(accuracy_score(yte, clf.predict(Xte)))
+            tested += len(yte)
+        if not accs:
+            return None, 0
+        return sum(accs) / len(accs) * 100.0, tested
+    except Exception as e:
+        print("walk_forward_acc failed:", e)
+        return None, 0
 
 
 def ml_train(pair, closes, keys=None, force=False):
@@ -643,12 +643,17 @@ def ml_train(pair, closes, keys=None, force=False):
                 try:
                     clf = _ml_estimator(key)
                     clf.fit(Xtr, ytr)
+                    from sklearn.metrics import accuracy_score
                     acc = 0.0
+                    oos_n = len(yte)
                     if Xte and len(set(yte)) >= 1:
-                        from sklearn.metrics import accuracy_score
                         acc = float(accuracy_score(yte, clf.predict(Xte))) * 100.0
+                    wf_acc, wf_n = walk_forward_acc(closes, key)
+                    if wf_acc is not None:
+                        acc, oos_n = wf_acc, wf_n
                     _ml_models[ck] = clf
                     _ml_meta[ck] = {"acc": round(acc, 1), "n": len(X),
+                                    "oos_n": oos_n,
                                     "trained_at": time.time()}
                     trained = True
                 except Exception as e:
@@ -694,7 +699,7 @@ def _ml_predict(closes, model=None, pair=None):
     """Real model probability score in [-1, 1]; learns on demand."""
     try:
         pair = str(pair or globals().get("sel_pair") or "EURUSD-OTC")
-        key = str(model or globals().get("CURRENT_MODEL") or "solari")
+        key = str(model or globals().get("CURRENT_MODEL") or "engine")
         ck = f"{pair}#{key}"
         with _ml_lock:
             est = _ml_models.get(ck)
@@ -776,7 +781,7 @@ def _multi_tf_confluence(pair, period_sec):
             if closes and len(closes) >= PERIOD + RSI_PERIOD + 6:
                 stk = _indicator_stack(closes)
                 i = len(stk["s"]) - 1
-                sig = decide_at(stk, i, MODEL_PARAMS.get(CURRENT_MODEL, MODEL_PARAMS["solari"]))
+                sig = decide_at(stk, i, MODEL_PARAMS.get(CURRENT_MODEL, MODEL_PARAMS["engine"]))
                 if sig:
                     signals.append(sig)
         if len(signals) >= 2:
@@ -881,7 +886,7 @@ def gate_score(res, model=None):
         base = float(res["measured"])
     else:
         params = MODEL_PARAMS.get(model or res.get("model") or CURRENT_MODEL,
-                                  MODEL_PARAMS["solari"])
+                                  MODEL_PARAMS["engine"])
         base = params["normal_acc"]
     news_s = res.get("news_sentiment", 0.0)
     social_s = res.get("social_sentiment", 0.0)
@@ -1541,26 +1546,12 @@ def screen_head(title, step):
     return f"\U0001f7e2 Spike\n\n<b>{title}</b>\n\n{dots}\n"
 
 def kb_menu():
-    return [[{"text": "Start", "callback_data": "ui:model"}]]
-
-def kb_model():
-    rows = []
-    for i in range(0, len(MODELS), 2):
-        chunk = MODELS[i:i + 2]
-        rows.append([{"text": _model_btn(k), "callback_data": f"mdl:{k}"} for k in chunk])
-    rows.append([{"text": "Back to Menu", "callback_data": "ui:menu"}])
-    return rows
-
-def _model_btn(key):
-    pct, n = model_perf(key)
-    if pct is None or n < 3:
-        return MODEL_NAMES[key]
-    return f"{MODEL_NAMES[key]} {pct:.0f}%"
+    return [[{"text": "Start", "callback_data": "ui:market"}]]
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
              {"text": "OTC", "callback_data": "mkt:otc"}],
-            [{"text": "Back to Model", "callback_data": "ui:model"}]]
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 def kb_pairs(page, pairs, per=8):
     pages = max(1, (len(pairs) + per - 1) // per)
@@ -1692,11 +1683,13 @@ def card_caption(res, m, conf, pair, tf_txt):
     news_s = res.get("news_sentiment", 0.0)
     social_s = res.get("social_sentiment", 0.0)
     regime = res.get("regime", "normal")
-    mkey = str(globals().get("sel_model") or "solari")
+    mkey = str(globals().get("sel_model") or "engine")
     learn_parts = []
     mmeta = _ml_meta.get(f"{pair}#{mkey}") or {}
     if mmeta.get("acc"):
-        learn_parts.append(f"{mmeta['acc']:.0f}% backtest ({int(mmeta.get('n', 0))} bars)")
+        oos = int(mmeta.get("oos_n") or 0)
+        learn_parts.append(f"{mmeta['acc']:.0f}% walk-forward"
+                           + (f" on {oos} test bars" if oos else ""))
     learn_line = (f"\U0001f9e0 {MODEL_NAMES.get(mkey, mkey)}: "
                   f"{' \u00b7 '.join(learn_parts)}\n\n" if learn_parts else "")
     win_lines = []
@@ -1801,7 +1794,7 @@ def gen_text(pct, values):
 HELP_TEXT = (
     "/start - Main menu\n"
     "/stop - Stop all signals\n"
-    "Flow: Start -> Select AI Model -> Select a market (Stock/OTC) -> "
+    "Flow: Start -> Select a market (Stock/OTC) -> "
     "Select a currency pair -> Select trading time -> signal\n"
     "No orders are placed - signals are display only."
 )
@@ -1813,7 +1806,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
     print("Bot starting (SPIKE UI, live feed, on-demand signals)...")
     S = load_settings()
-    sel_model = str(S.get("model") or "solari")
+    sel_model = str(S.get("model") or "engine")
     sel_market = str(S.get("market") or "otc")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
@@ -1868,25 +1861,12 @@ if __name__ == "__main__":
                        "min_payout": MIN_PAYOUT})
 
     def send_menu(chat):
-        send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
+        send(f"{screen_head('Spike', 1)}\nSignal engine for Pocket Option.\n"
              f"Real live market data. No orders are placed.",
              chat_id=chat, keyboard=kb_menu(), html_on=True)
 
-    def send_model_screen(chat, edit_mid=None):
-        label = MODEL_PARAMS.get(sel_model, {}).get("label", "")
-        pct, n = model_perf(sel_model)
-        stats = (f" \u00b7 <b>{pct:.0f}%</b> from {n} settled signals"
-                 if pct is not None and n >= 3 else " \u00b7 learning")
-        text = (f"{screen_head('Model', 1)}\nSelect AI Model:  <i>{now_hm()}</i>\n\n"
-                f"\U0001f9e0 {MODEL_NAMES.get(sel_model, sel_model)}: {label}{stats}")
-        if edit_mid:
-            edit(text, chat, edit_mid, html_on=True)
-            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_model()}})
-        else:
-            send(text, chat_id=chat, keyboard=kb_model(), html_on=True)
-
     def send_market_screen(chat, edit_mid=None):
-        text = f"{screen_head('Market', 2)}\nSelect a market:  <i>{now_hm()}</i>"
+        text = f"{screen_head('Market', 1)}\nSelect a market:  <i>{now_hm()}</i>"
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_market()}})
@@ -1895,9 +1875,9 @@ if __name__ == "__main__":
 
     def send_pair_screen(chat, page=0, edit_mid=None):
         pairs = market_pairs(sel_market)
-        text = f"{screen_head('Pair', 3)}\nSelect a currency pair:  <i>{now_hm()}</i>"
+        text = f"{screen_head('Pair', 2)}\nSelect a currency pair:  <i>{now_hm()}</i>"
         if not pairs:
-            text = f"{screen_head('Pair', 3)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
+            text = f"{screen_head('Pair', 2)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
             keyboard = kb_market()
         else:
             pages = max(1, (len(pairs) + 7) // 8)
@@ -1912,7 +1892,7 @@ if __name__ == "__main__":
             send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_time_screen(chat, edit_mid=None):
-        text = f"{screen_head('Time', 4)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
+        text = f"{screen_head('Time', 3)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_times()}})
@@ -2009,20 +1989,7 @@ if __name__ == "__main__":
             answer(cb_id)
             if data == "ui:menu":
                 send_menu(chat)
-            elif data == "ui:model":
-                mid = cb.get("message", {}).get("message_id")
-                send_model_screen(chat, edit_mid=mid)
-            elif data.startswith("mdl:"):
-                key = data.split(":", 1)[1]
-                if key in MODEL_PARAMS:
-                    sel_model = key
-                    globals()["CURRENT_MODEL"] = key
-                    persist()
-                    warm_feed(sel_pair, sel_time)
-                    ml_train_async(sel_pair, sel_time)
-                    mid = cb.get("message", {}).get("message_id")
-                    send_market_screen(chat, edit_mid=mid)
-            elif data == "ui:market":
+            elif data in ("ui:model", "ui:market"):
                 mid = cb.get("message", {}).get("message_id")
                 send_market_screen(chat, edit_mid=mid)
             elif data.startswith("mkt:"):
@@ -2139,7 +2106,7 @@ if __name__ == "__main__":
                     m = tech_metrics(closes_w, ohlc, st)
                     send_card(watch["chat"], st, m, gate_score(st), closes_w)
                     track_add(sel_pair, sel_time, st["signal"], m.get("price"),
-                              globals().get("sel_model", "solari"),
+                              globals().get("sel_model", "engine"),
                               st.get("regime"), features=_feat_last(closes_w))
                     print(f"Watch alert {st['signal']} {sel_pair}")
 
