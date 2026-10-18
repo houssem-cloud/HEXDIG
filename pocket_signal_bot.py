@@ -25,6 +25,7 @@ Run: pip install pandas numpy requests
 import time
 import json
 import os
+import math
 import html
 import threading
 import requests
@@ -112,6 +113,11 @@ RSI_PERIOD = 14
 HORIZON = 1
 SQUEEZE_PCT = 40
 
+# ---- honest edge gate (tunable via pocket_settings.json) ----
+EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
+MIN_BACKTEST_N = 40    # minimum resolved setups before the edge is trusted
+MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
+
 MODEL_PARAMS = {
     "solari":     {"w": (2, 2, 1, 1), "squeeze_acc": 51.6, "normal_acc": 46.9,
                    "label": "Random Forest - balanced vote"},
@@ -167,8 +173,16 @@ def load_settings():
 
 def save_settings(s):
     try:
+        cur = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE) as f:
+                    cur = json.load(f)
+            except Exception:
+                cur = {}
+        cur.update(s)
         with open(SETTINGS_FILE, "w") as f:
-            json.dump(s, f)
+            json.dump(cur, f)
     except Exception as e:
         print("Settings save failed:", e)
 
@@ -277,6 +291,38 @@ def _compute_volume(closes):
     return {"vol": vol_label, "vol_pct": vol_pct}
 
 
+def pair_payout(pair):
+    """Current payout % for an asset, or None. Never raises."""
+    if pocket_payout is None:
+        return None
+    try:
+        return pocket_payout.get_payout(pair)
+    except Exception:
+        return None
+
+
+def payout_break_even(payout_pct):
+    """Win-rate (%) required to break even at a given payout %."""
+    try:
+        p = float(payout_pct)
+    except Exception:
+        return None
+    if p <= 0:
+        return None
+    return 100.0 / (1.0 + p / 100.0)
+
+
+def _wilson_lower(wins, n, z=1.96):
+    """Lower bound of the 95% Wilson interval for a win rate, in %."""
+    if not n:
+        return 0.0
+    p = wins / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2 * n)
+    margin = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n)
+    return max(0.0, (centre - margin) / denom) * 100.0
+
+
 def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["solari"])
@@ -287,7 +333,9 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
            "setup": False, "regime": "normal", "horizon": HORIZON,
            "measured": params["normal_acc"], "full_acc": 0.0,
            "full_wins": 0, "full_total": 0, "news_sentiment": 0.0,
-           "social_sentiment": 0.0, "volume": "Normal", "confidence_factors": {}}
+           "social_sentiment": 0.0, "volume": "Normal", "confidence_factors": {},
+           "tradeable": False, "payout": None, "break_even": None,
+           "wilson": 0.0, "gate_note": ""}
     need = PERIOD + RSI_PERIOD + 6
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
@@ -308,6 +356,28 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
             f_wins += 1
     out["full_wins"], out["full_total"] = f_wins, f_total
     out["full_acc"] = (f_wins / f_total * 100.0) if f_total else 0.0
+
+    # ---- honest edge gate: does the measured hit-rate beat break-even? ----
+    payout = pair_payout(pair)
+    out["payout"] = payout
+    be = payout_break_even(payout)
+    out["break_even"] = be
+    out["wilson"] = _wilson_lower(f_wins, f_total)
+    if be is None:
+        out["gate_note"] = "Payout unavailable - cannot judge the edge."
+    elif f_total < MIN_BACKTEST_N:
+        out["gate_note"] = (f"Only {f_total} resolved setups - need "
+                            f"{MIN_BACKTEST_N} to trust the edge.")
+    elif (payout or 0) < MIN_PAYOUT:
+        out["gate_note"] = (f"Payout {payout:.0f}% is below the "
+                            f"{MIN_PAYOUT:.0f}% minimum.")
+    elif out["full_acc"] >= be + EDGE_MARGIN:
+        out["tradeable"] = True
+        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% beats break-even "
+                            f"{be:.0f}% by {out['full_acc'] - be:.1f}.")
+    else:
+        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above break-even "
+                            f"{be:.0f}% (need +{EDGE_MARGIN:.0f}).")
 
     i = len(s) - 1
     out["rsi"] = float(stk["rsi"].iloc[i]) if not pd.isna(stk["rsi"].iloc[i]) else None
@@ -375,7 +445,8 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     conf_final = min(95.0, max(20.0, gate_score(out, model)))
     out["confidence_factors"]["regime"] = out["regime"]
     out["confidence"] = conf_final
-    out["signal"] = decide_at(stk, i, params) or "WAIT"
+    vote = decide_at(stk, i, params) or "WAIT"
+    out["signal"] = vote if out["tradeable"] else "NO TRADE"
     out["accuracy"] = out["measured"]
     return out
 
@@ -861,8 +932,9 @@ def track_add(pair, tf, direction, entry, model, regime, features=None):
         if pocket_payout is not None:
             cl = pocket_payout.live_closes(pair, tfi)
             if cl and len(cl) >= 70:
-                entry = float(cl[-1])
-                features = _feat_last(cl)
+                if entry is None:
+                    entry = float(cl[-1])
+                features = features or _feat_last(cl)
     except Exception:
         pass
     try:
@@ -1201,18 +1273,19 @@ def watch_text(rep, pair, period_sec):
     if st["signal"] in ("CALL", "PUT"):
         word = "BUY / Higher" if st["signal"] == "CALL" else "SELL / Lower"
         dot = "\U0001f7e2" if st["signal"] == "CALL" else "\U0001f534"
-        acc = st.get("measured", st.get("accuracy", 0.0))
-        reg = st.get("regime", "normal")
-        tag = "QUIET-MARKET EDGE" if st.get("setup") else "signal"
-        hist = (f"measured {acc:.0f}% in {reg} regime "
-                f"({st.get('horizon', HORIZON)}-candle target)")
+        edge = st.get("full_acc", 0.0)
+        be = st.get("break_even") or 0.0
+        tag = "EDGE" if st.get("tradeable") else "signal"
+        hist = (f"{edge:.0f}% edge vs {be:.0f}% break-even "
+                f"({st.get('horizon', HORIZON)}-bar target)")
         news_note = ""
         if st.get("news_sentiment") is not None:
             ns = st["news_sentiment"]
             news_note = f"\n\u26a1 News: {'Bullish' if ns > 0 else 'Bearish'} ({abs(ns):.2f})"
         status = f"{dot} <b>{tag}: {word}</b> ({hist}){news_note}"
     else:
-        status = f"\u23f3 {html.escape(st['note'] or 'not enough candle history yet', quote=False)}"
+        reason = st.get("gate_note") or st.get("note") or "not enough candle history yet"
+        status = f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(reason, quote=False)}"
     lines = [
         f"\U0001f4ca <b>{html.escape(fmt_pair(pair))}</b> \u00b7 {tf_label(period_sec)} \u2014 live",
         "",
@@ -1654,12 +1727,39 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\U0001f4e6 Signal strength:\n"
         f"\u2022 Strength: <b>{m['strength_label']} ({conf:.0f}%)</b> "
         f"\u00b7 {m.get('n_signals', 0)} past signals checked\n"
+        f"\u2022 Edge: <b>{res.get('full_acc', 0):.0f}%</b> vs break-even "
+        f"<b>{(res.get('break_even') or 0):.0f}%</b> "
+        f"(payout {(res.get('payout') or 0):.0f}%)\n"
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
         f"{learn_line}"
         f"{win_line}"
         f"{now_hm()}"
     )
+
+def no_trade_text(res, m, pair, tf_txt):
+    edge = res.get("full_acc", 0.0)
+    be = res.get("break_even")
+    payout = res.get("payout")
+    n = res.get("full_total", 0)
+    reason = res.get("gate_note") or "No statistical edge right now."
+    lines = [
+        f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(fmt_pair(pair))} | {tf_txt}",
+        "",
+        "This setup does not clear the break-even bar, so no BUY/SELL is issued.",
+        "",
+        f"\u2022 Measured edge: <b>{edge:.0f}%</b>"
+        + (f" over {n} setups" if n else ""),
+        f"\u2022 Break-even needed: <b>{be:.0f}%</b>" if be
+        else "\u2022 Break-even: n/a (no payout)",
+        f"\u2022 Payout: <b>{payout:.0f}%</b>" if payout
+        else "\u2022 Payout: n/a",
+        f"\u2022 Reason: {html.escape(reason)}",
+        "",
+        now_hm(),
+    ]
+    return "\n".join(lines)
+
 
 def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     pair = pair or sel_pair
@@ -1719,6 +1819,9 @@ if __name__ == "__main__":
     sel_time = int(S.get("last_time") or 60)
     auto_on = False
     CURRENT_MODEL = sel_model
+    EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
+    MIN_BACKTEST_N = int(S.get("min_backtest_n", MIN_BACKTEST_N))
+    MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     update_offset = None
     owner_id = None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)
     last_state = {}
@@ -1760,7 +1863,9 @@ if __name__ == "__main__":
 
     def persist():
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
-                       "model": sel_model, "market": sel_market})
+                       "model": sel_model, "market": sel_market,
+                       "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
+                       "min_payout": MIN_PAYOUT})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nAI models for Pocket Option.\n"
@@ -1823,6 +1928,10 @@ if __name__ == "__main__":
                  f"A real BUY/SELL card needs live candles - tap the signal button "
                  f"again in a minute and it will appear.",
                  chat_id=chat, keyboard=kb_signal(), html_on=True)
+            return False
+        if res["signal"] == "NO TRADE":
+            send(no_trade_text(res, m, sel_pair, tf_txt), chat_id=chat,
+                 keyboard=kb_signal(), html_on=True)
             return False
         if res["signal"] not in ("CALL", "PUT"):
             send(f"\U0001f504 Still loading candle history for "

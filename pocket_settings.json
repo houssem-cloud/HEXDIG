@@ -1,1 +1,1 @@
-{"last_pair": "CHFJPY-OTC", "last_time": 60, "auto": false, "model": "lumina", "market": "otc"}
+{"last_pair": "CHFJPY-OTC", "last_time": 60, "auto": false, "model": "lumina", "market": "otc", "edge_margin": 2.0, "min_backtest_n": 40, "min_payout": 60.0}
