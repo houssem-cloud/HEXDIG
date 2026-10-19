@@ -248,6 +248,29 @@ class TestScanner(unittest.TestCase):
         self.assertIn("No pairs", bot.scan_text([], 60, "otc"))
 
 
+class TestAcceptRegistry(unittest.TestCase):
+    def test_remember_signal_stores_context(self):
+        bot.PENDING_SIGNALS.clear()
+        bot.remember_signal(7, {"signal": "CALL"}, "EURUSD-OTC", 60, 1.105)
+        ctx = bot.PENDING_SIGNALS[7]
+        self.assertEqual(ctx["signal"], "CALL")
+        self.assertEqual(ctx["pair"], "EURUSD-OTC")
+        self.assertEqual(ctx["period"], 60)
+        bot.PENDING_SIGNALS.clear()
+
+    def test_remember_signal_ignores_empty_mid(self):
+        bot.PENDING_SIGNALS.clear()
+        bot.remember_signal(0, {"signal": "PUT"}, "EURUSD-OTC", 60, 1.1)
+        self.assertEqual(bot.PENDING_SIGNALS, {})
+
+    def test_registry_is_bounded(self):
+        bot.PENDING_SIGNALS.clear()
+        for i in range(1, 260):
+            bot.remember_signal(i, {"signal": "CALL"}, "EURUSD-OTC", 60, 1.0)
+        self.assertLessEqual(len(bot.PENDING_SIGNALS), 200)
+        bot.PENDING_SIGNALS.clear()
+
+
 class TestSafety(unittest.TestCase):
     def test_place_trade_disabled_by_default(self):
         import pocket_payout

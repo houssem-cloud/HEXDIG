@@ -12,11 +12,14 @@ is replayed over the pair's own history and its out-of-sample hit-rate is
 compared to the payout break-even. A BUY/SELL card is shown ONLY when that edge
 clears break-even; otherwise the bot says NO TRADE.
 
-No orders, no balance, no auto-trading - display only.
+Display-only by default. The card's "Accept signal" button can place a real
+order, but ONLY when the bot is started with ALLOW_TRADING=1 and an SSID is
+saved (see pocket_payout.py); otherwise it just prints a disabled notice.
 
 Run: pip install pandas numpy requests
      set TELEGRAM_TOKEN (BotFather token) and TELEGRAM_CHAT_ID env vars
      python pocket_signal_bot.py
+     (add ALLOW_TRADING=1 to enable the Accept-order button)
 """
 
 import time
@@ -50,6 +53,23 @@ SQUEEZE_PCT = 40
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
 MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
+TRADE_AMOUNT = 1.0     # stake for an accepted signal (only used with ALLOW_TRADING=1)
+
+# Signal + message-id -> context, so "Accept signal" can place the order the card
+# showed. Only the owner's chats reach here, and orders still need ALLOW_TRADING=1.
+PENDING_SIGNALS = {}
+
+
+def remember_signal(mid, res, pair, period, price):
+    if not mid:
+        return
+    PENDING_SIGNALS[mid] = {"pair": pair, "period": int(period),
+                            "signal": res.get("signal"), "price": price,
+                            "ts": time.time()}
+    if len(PENDING_SIGNALS) > 200:
+        oldest = sorted(PENDING_SIGNALS, key=lambda k: PENDING_SIGNALS[k]["ts"])
+        for k in oldest[:100]:
+            PENDING_SIGNALS.pop(k, None)
 
 # Single engine: one transparent rule vote, gated by that same rule's measured
 # out-of-sample hit-rate vs. the payout break-even. The previous six "models"
@@ -1405,9 +1425,10 @@ def kb_times():
     return rows
 
 def kb_signal():
-    return [[{"text": "Request another signal", "callback_data": "sig:again"}],
-            [{"text": "\U0001f50e Find a trade", "callback_data": "scan:run"},
-             {"text": "Back to Menu", "callback_data": "ui:menu"}]]
+    return [[{"text": "\u2705 Accept signal", "callback_data": "sig:accept"}],
+            [{"text": "\U0001f504 Another signal", "callback_data": "sig:again"},
+             {"text": "\U0001f50e Find a trade", "callback_data": "scan:run"}],
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1657,13 +1678,15 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
             except Exception:
                 pass
         if mid:
-            return True
+            remember_signal(mid, res, pair, sel_time, m.get("price"))
+            return mid
     buy = res["signal"] == "CALL"
     dot = "\U0001f7e2" if buy else "\U0001f534"
-    send(f"{dot} <b>{'BUY' if buy else 'SELL'}</b> - "
-         f"{html.escape(fmt_pair(pair))} | {tf_txt}\n\n{cap}",
-         chat_id=chat, keyboard=kb_signal(), html_on=True)
-    return True
+    mid = send(f"{dot} <b>{'BUY' if buy else 'SELL'}</b> - "
+               f"{html.escape(fmt_pair(pair))} | {tf_txt}\n\n{cap}",
+               chat_id=chat, keyboard=kb_signal(), html_on=True)
+    remember_signal(mid, res, pair, sel_time, m.get("price"))
+    return mid
 
 GEN_STEPS = ["Volatility scan", "RSI Analysis", "MACD Status", "Moving Average",
              "Signal Accuracy"]
@@ -1683,11 +1706,13 @@ HELP_TEXT = (
     "/start - Main menu\n"
     "/scan - Scan every pair for a real edge now\n"
     "/auto - Toggle continuous auto-scan alerts\n"
+    "/amount N - Set the stake for accepted signals\n"
     "/stop - Stop all signals\n"
     "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
-    "Or just tap Find a trade to scan all pairs and get pinged only when "
-    "one clears break-even.\n"
-    "No orders are placed - signals are display only."
+    "Tap Find a trade to scan all pairs and get pinged only when one clears "
+    "break-even.\n"
+    "Accept signal places a real order ONLY if the bot was started with "
+    "ALLOW_TRADING=1 (and your SSID is saved). Otherwise it is display-only."
 )
 
 if __name__ == "__main__":
@@ -1706,6 +1731,7 @@ if __name__ == "__main__":
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
+    TRADE_AMOUNT = max(0.01, float(S.get("trade_amount", TRADE_AMOUNT)))
     update_offset = None
     owner_id = None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)
     last_state = {}
@@ -1729,8 +1755,9 @@ if __name__ == "__main__":
 
     def _emit_signal(chat, pair, period_sec, res, closes):
         m = tech_metrics(closes, fetch_ohlc(pair, period_sec), res)
-        send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
-             keyboard=kb_signal(), html_on=True)
+        mid = send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
+                   keyboard=kb_signal(), html_on=True)
+        remember_signal(mid, res, pair, period_sec, m.get("price"))
         track_add(pair, period_sec, res["signal"], m.get("price"), sel_model,
                   res.get("regime"), features=_feat_last(closes))
 
@@ -1758,7 +1785,8 @@ if __name__ == "__main__":
                                  "message_id": mid,
                                  "reply_markup": {"inline_keyboard": kb_signal()}})
                     else:
-                        send(txt, chat_id=chat, html_on=True)
+                        mid = send(txt, chat_id=chat, keyboard=kb_signal(), html_on=True)
+                    remember_signal(mid, res, best["pair"], sel_time, m.get("price"))
                     track_add(best["pair"], sel_time, res["signal"], m.get("price"),
                               sel_model, res.get("regime"), features=_feat_last(closes))
                 else:
@@ -1777,6 +1805,39 @@ if __name__ == "__main__":
                 scan_state["running"] = False
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def accept_signal(chat, ctx, mid):
+        if not ctx:
+            send("This signal has expired \u2014 ask for a fresh one.", chat_id=chat)
+            return
+        if pocket_payout is None:
+            send("Live trading is unavailable on this host (library not loaded).",
+                 chat_id=chat)
+            return
+        if os.getenv("ALLOW_TRADING") != "1":
+            send("\U0001f512 <b>Accept is disabled.</b> Restart the bot with "
+                 "ALLOW_TRADING=1 to allow real orders.\n\nSignal: "
+                 f"{ctx['signal']} {html.escape(fmt_pair(ctx['pair']))} \u00b7 "
+                 f"{tf_label(ctx['period'])}", chat_id=chat, html_on=True)
+            return
+        amount = TRADE_AMOUNT
+        ok, msg = pocket_payout.place_trade(ctx["pair"], ctx["signal"], amount,
+                                            ctx["period"])
+        if ok:
+            PENDING_SIGNALS.pop(mid, None)
+            bal = None
+            try:
+                bal = pocket_payout.account_balance()
+            except Exception:
+                pass
+            extra = f"\nBalance: {bal:.2f}" if bal is not None else ""
+            send(f"\u2705 <b>Order placed</b>\n{ctx['signal']} "
+                 f"{html.escape(fmt_pair(ctx['pair']))} \u00b7 {tf_label(ctx['period'])} "
+                 f"\u00b7 stake {amount:g}\nTicket: {html.escape(str(msg))}{extra}",
+                 chat_id=chat, html_on=True)
+        else:
+            send(f"\u274c <b>Order failed</b>: {html.escape(str(msg))}",
+                 chat_id=chat, html_on=True)
 
     def autoscan_tick():
         if scan_state["running"]:
@@ -1832,7 +1893,7 @@ if __name__ == "__main__":
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
                        "model": sel_model, "market": sel_market,
                        "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
-                       "min_payout": MIN_PAYOUT})
+                       "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nSignal engine for Pocket Option.\n"
@@ -1942,6 +2003,7 @@ if __name__ == "__main__":
 
     def handle_update(upd):
         global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
+        global TRADE_AMOUNT
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id", "")
@@ -1994,6 +2056,9 @@ if __name__ == "__main__":
                 run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
+            elif data == "sig:accept":
+                mid = cb.get("message", {}).get("message_id")
+                accept_signal(chat, PENDING_SIGNALS.get(mid), mid)
             elif data == "scan:run":
                 run_scan(chat)
             elif data == "scan:toggle":
@@ -2037,6 +2102,17 @@ if __name__ == "__main__":
             send("All signals stopped.", chat_id=chat)
         elif cmd in ("/scan", "scan"):
             run_scan(chat)
+        elif cmd in ("/amount", "amount", "/stake", "stake"):
+            parts = raw.split()
+            if len(parts) >= 2:
+                try:
+                    TRADE_AMOUNT = max(0.01, float(parts[1]))
+                    persist()
+                    send(f"Stake set to {TRADE_AMOUNT:g}.", chat_id=chat)
+                except Exception:
+                    send("Usage: /amount 1", chat_id=chat)
+            else:
+                send(f"Stake is {TRADE_AMOUNT:g}. Usage: /amount 1", chat_id=chat)
         elif cmd in ("/auto", "auto"):
             autoscan["on"] = not autoscan["on"]
             autoscan["chat"] = chat
