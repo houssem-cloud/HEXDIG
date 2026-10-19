@@ -158,6 +158,53 @@ class TestFetchCandles(unittest.TestCase):
         self.assertEqual(out, [{"close": 2.0}])
 
 
+class TestScanner(unittest.TestCase):
+    def setUp(self):
+        self._mp = bot.market_pairs
+        self._gs = bot.get_series
+        self._an = bot.analyze
+        self._min = bot.MIN_PAYOUT
+        bot.MIN_PAYOUT = 60.0
+
+    def tearDown(self):
+        bot.market_pairs = self._mp
+        bot.get_series = self._gs
+        bot.analyze = self._an
+        bot.MIN_PAYOUT = self._min
+
+    def _wire(self, tradeable_pairs):
+        bot.market_pairs = lambda market: [("AAA-OTC", 95.0),
+                                           ("BBB-OTC", 50.0),
+                                           ("CCC-OTC", 95.0)]
+        bot.get_series = lambda pair, period_sec, fetch=True: ([1.0, 1.1, 1.2], "")
+
+        def fake_analyze(closes, model=None, news_symbol=None, pair=None, period=None):
+            tr = pair in tradeable_pairs
+            return {"signal": "CALL" if tr else "NO TRADE",
+                    "full_acc": 60.0 if tr else 45.0, "full_total": 200,
+                    "break_even": 52.0, "payout": 95.0, "wilson": 55.0,
+                    "tradeable": tr, "validated": tr, "gate_note": ""}
+
+        bot.analyze = fake_analyze
+
+    def test_scan_filters_low_payout_and_sorts(self):
+        self._wire({"AAA-OTC"})
+        res = bot.scan_pairs(60, "otc")
+        self.assertEqual([r["pair"] for r in res], ["AAA-OTC", "CCC-OTC"])
+        self.assertTrue(res[0]["tradeable"])
+        self.assertFalse(res[1]["tradeable"])
+        self.assertEqual(res[0]["edge"], 60.0)
+
+    def test_scan_text_lists_candidates(self):
+        self._wire({"AAA-OTC"})
+        txt = bot.scan_text(bot.scan_pairs(60, "otc"), 60, "otc")
+        self.assertIn("AAA", txt)
+        self.assertIn("pairs checked", txt)
+
+    def test_scan_text_empty(self):
+        self.assertIn("No pairs", bot.scan_text([], 60, "otc"))
+
+
 class TestSafety(unittest.TestCase):
     def test_place_trade_disabled_by_default(self):
         import pocket_payout

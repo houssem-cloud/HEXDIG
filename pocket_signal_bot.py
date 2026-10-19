@@ -1367,7 +1367,9 @@ def screen_head(title, step):
     return f"\U0001f7e2 Spike\n\n<b>{title}</b>\n\n{dots}\n"
 
 def kb_menu():
-    return [[{"text": "Start", "callback_data": "ui:market"}]]
+    return [[{"text": "Start", "callback_data": "ui:market"}],
+            [{"text": "\U0001f50e Find a trade", "callback_data": "scan:run"},
+             {"text": "\U0001f501 Auto-scan", "callback_data": "scan:toggle"}]]
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
@@ -1397,7 +1399,8 @@ def kb_times():
 
 def kb_signal():
     return [[{"text": "Request another signal", "callback_data": "sig:again"}],
-            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+            [{"text": "\U0001f50e Find a trade", "callback_data": "scan:run"},
+             {"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1569,6 +1572,70 @@ def no_trade_text(res, m, pair, tf_txt):
     return "\n".join(lines)
 
 
+def scan_pairs(period_sec, market="otc", max_pairs=30):
+    """Run the edge gate over every pair in a market, ranked best-first.
+
+    Returns a list of dicts (one per usable pair) sorted so any tradeable pair
+    comes first, then by how far its measured edge sits above break-even. Pairs
+    whose payout is already below MIN_PAYOUT are skipped before any fetch."""
+    out = []
+    try:
+        pairs = market_pairs(market)
+    except Exception:
+        pairs = []
+    for pair, pay in pairs[:max_pairs]:
+        if pay and pay < MIN_PAYOUT:
+            continue
+        try:
+            closes, note = get_series(pair, period_sec, fetch=True)
+            if note or not closes:
+                continue
+            res = analyze(closes, pair=pair, period=period_sec)
+            be = res.get("break_even")
+            edge = res.get("full_acc", 0.0)
+            out.append({
+                "pair": pair, "signal": res.get("signal"), "edge": edge,
+                "wilson": res.get("wilson", 0.0), "break_even": be,
+                "payout": res.get("payout"), "total": res.get("full_total", 0),
+                "tradeable": bool(res.get("tradeable")),
+                "validated": bool(res.get("validated")),
+                "note": res.get("gate_note", ""),
+                "margin": (edge - be) if be else -99.0,
+                "res": res, "closes": closes,
+            })
+        except Exception:
+            continue
+    out.sort(key=lambda x: (x["tradeable"], x["margin"]), reverse=True)
+    return out
+
+
+def scan_text(results, period_sec, market):
+    tf = tf_label(period_sec)
+    head = f"\U0001f50e <b>Scan {market.upper()}</b> \u00b7 {tf}\n"
+    if not results:
+        return head + "\nNo pairs with usable live data right now."
+    lines = [head,
+             f"{len(results)} pairs checked \u2014 none clears break-even.", ""]
+    for r in results[:5]:
+        be = r.get("break_even") or 0.0
+        pay = r.get("payout") or 0.0
+        tag = "validated" if r.get("validated") else "replay"
+        lines.append(f"\u2022 {html.escape(fmt_pair(r['pair']))}: "
+                     f"<b>{r['edge']:.0f}%</b> vs {be:.0f}% "
+                     f"(payout {pay:.0f}%, {tag})")
+    lines += ["", "Closest is still short \u2014 nothing worth risking money on.",
+              "", now_hm()]
+    return "\n".join(lines)
+
+
+def autoscan_card_text(res, m, pair, tf_txt):
+    buy = res["signal"] == "CALL"
+    dot = "\U0001f7e2" if buy else "\U0001f534"
+    return (f"{dot} <b>AUTO {html.escape('BUY' if buy else 'SELL')}</b> "
+            f"\u2014 {html.escape(fmt_pair(pair))} | {tf_txt}\n\n"
+            f"{card_caption(res, m, gate_score(res), pair, tf_txt)}")
+
+
 def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     pair = pair or sel_pair
     tf_txt = tf_txt or tf_label(sel_time)
@@ -1607,9 +1674,12 @@ def gen_text(pct, values):
 
 HELP_TEXT = (
     "/start - Main menu\n"
+    "/scan - Scan every pair for a real edge now\n"
+    "/auto - Toggle continuous auto-scan alerts\n"
     "/stop - Stop all signals\n"
-    "Flow: Start -> Select a market (Stock/OTC) -> "
-    "Select a currency pair -> Select trading time -> signal\n"
+    "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
+    "Or just tap Find a trade to scan all pairs and get pinged only when "
+    "one clears break-even.\n"
     "No orders are placed - signals are display only."
 )
 
@@ -1643,6 +1713,89 @@ if __name__ == "__main__":
     WATCH_ALERT_GAP = 120
     watch = {"on": False, "chat": None, "msg": None, "t": 0.0, "alert": 0.0,
              "last_sig": None}
+
+    AUTOSCAN_GAP = 120
+    AUTOSCAN_COOLDOWN = 900
+    AUTOSCAN_MAX_PAIRS = 24
+    scan_state = {"running": False, "alerted": {}}
+    autoscan = {"on": False, "chat": None, "t": 0.0}
+
+    def _emit_signal(chat, pair, period_sec, res, closes):
+        m = tech_metrics(closes, fetch_ohlc(pair, period_sec), res)
+        send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
+             keyboard=kb_signal(), html_on=True)
+        track_add(pair, period_sec, res["signal"], m.get("price"), sel_model,
+                  res.get("regime"), features=_feat_last(closes))
+
+    def run_scan(chat):
+        if scan_state["running"]:
+            send("A scan is already running \u2014 hang on a moment.", chat_id=chat)
+            return
+        scan_state["running"] = True
+        mid = send(f"\U0001f50e Scanning {sel_market.upper()} pairs for a real edge\u2026",
+                   chat_id=chat, html_on=True)
+
+        def worker():
+            try:
+                results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
+                best = next((r for r in results if r["tradeable"]), None)
+                if best:
+                    res, closes = best["res"], best["closes"]
+                    m = tech_metrics(closes, fetch_ohlc(best["pair"], sel_time), res)
+                    cap = autoscan_card_text(res, m, best["pair"], tf_label(sel_time))
+                    txt = (f"\u2728 <b>Edge found</b> \u2014 cleared break-even "
+                           f"({best['edge']:.0f}% vs {best['break_even']:.0f}%).\n\n{cap}")
+                    if mid:
+                        edit(txt, chat, mid, html_on=True)
+                        api_call("editMessageReplyMarkup", {"chat_id": chat,
+                                 "message_id": mid,
+                                 "reply_markup": {"inline_keyboard": kb_signal()}})
+                    else:
+                        send(txt, chat_id=chat, html_on=True)
+                    track_add(best["pair"], sel_time, res["signal"], m.get("price"),
+                              sel_model, res.get("regime"), features=_feat_last(closes))
+                else:
+                    txt = scan_text(results, sel_time, sel_market)
+                    if mid:
+                        edit(txt, chat, mid, html_on=True)
+                    else:
+                        send(txt, chat_id=chat, html_on=True)
+            except Exception as e:
+                msg = f"\u26a0\ufe0f Scan failed: {html.escape(str(e))}"
+                if mid:
+                    edit(msg, chat, mid, html_on=True)
+                else:
+                    send(msg, chat_id=chat)
+            finally:
+                scan_state["running"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def autoscan_tick():
+        if scan_state["running"]:
+            return
+        scan_state["running"] = True
+        chat = autoscan["chat"]
+
+        def worker():
+            try:
+                results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
+                now = time.time()
+                for r in results:
+                    if not r["tradeable"]:
+                        continue
+                    if now - scan_state["alerted"].get(r["pair"], 0) < AUTOSCAN_COOLDOWN:
+                        continue
+                    scan_state["alerted"][r["pair"]] = now
+                    _emit_signal(chat, r["pair"], sel_time, r["res"], r["closes"])
+                    print(f"[autoscan] alert {r['signal']} {r['pair']} "
+                          f"{r['edge']:.0f}% vs {r['break_even']:.0f}%")
+            except Exception as e:
+                print("autoscan failed:", e)
+            finally:
+                scan_state["running"] = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_watch(chat):
         watch["on"] = True
@@ -1834,6 +1987,19 @@ if __name__ == "__main__":
                 run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
+            elif data == "scan:run":
+                run_scan(chat)
+            elif data == "scan:toggle":
+                autoscan["on"] = not autoscan["on"]
+                autoscan["chat"] = chat
+                autoscan["t"] = 0.0
+                if autoscan["on"]:
+                    send(f"\U0001f501 <b>Auto-scan ON</b> \u2014 {sel_market.upper()}, "
+                         f"{tf_label(sel_time)}. I'll check every "
+                         f"{AUTOSCAN_GAP}s and message you only when a pair clears "
+                         f"break-even.", chat_id=chat, html_on=True)
+                else:
+                    send("\U0001f501 Auto-scan OFF.", chat_id=chat)
             elif data == "w:stop":
                 stop_watch(chat)
             return
@@ -1857,12 +2023,21 @@ if __name__ == "__main__":
             send_menu(chat)
         elif cmd in ("/stop", "stop"):
             auto_on = False
+            autoscan["on"] = False
             persist()
             if watch["on"]:
                 stop_watch(chat)
             send("All signals stopped.", chat_id=chat)
+        elif cmd in ("/scan", "scan"):
+            run_scan(chat)
+        elif cmd in ("/auto", "auto"):
+            autoscan["on"] = not autoscan["on"]
+            autoscan["chat"] = chat
+            autoscan["t"] = 0.0
+            send(f"\U0001f501 Auto-scan {'ON' if autoscan['on'] else 'OFF'}.",
+                 chat_id=chat)
         elif cmd in ("/help", "help"):
-            send("Commands:\n/start - Main menu\n/stop - Stop all signals", chat_id=chat)
+            send(HELP_TEXT, chat_id=chat)
 
     import queue as _queue
     update_q = _queue.Queue()
@@ -1919,6 +2094,10 @@ if __name__ == "__main__":
                               globals().get("sel_model", "engine"),
                               st.get("regime"), features=_feat_last(closes_w))
                     print(f"Watch alert {st['signal']} {sel_pair}")
+
+        if autoscan["on"] and autoscan["chat"] and time.time() - autoscan["t"] >= AUTOSCAN_GAP:
+            autoscan["t"] = time.time()
+            autoscan_tick()
 
         if auto_on and owner_id and time.time() - auto_tick >= 60:
             auto_tick = time.time()
