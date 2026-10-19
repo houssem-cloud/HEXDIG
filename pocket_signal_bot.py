@@ -175,45 +175,71 @@ def save_settings(s):
         print("Settings save failed:", e)
 
 # ===== strategy =====
-def _indicator_stack(closes):
-    """Precompute every series the decision needs."""
+def _indicator_stack(closes, ohlc=None):
+    """Precompute every series the decision needs.
+
+    When real OHLC is supplied, True Range / Wilder ATR / +DI / -DI / ADX and
+    the stochastic/Williams ranges use actual high/low (the same formulas as
+    backtrader's atr.py and directionalmove.py). Otherwise it falls back to a
+    close-only approximation.
+    """
     s = pd.Series([float(x) for x in closes])
+    n = len(s)
+    if ohlc and len(ohlc) >= n:
+        rows = ohlc[-n:]
+        high = pd.Series([float(r["h"]) for r in rows], index=s.index)
+        low = pd.Series([float(r["l"]) for r in rows], index=s.index)
+    else:
+        high = s.copy()
+        low = s.copy()
+
     ema9 = s.ewm(span=9, adjust=False).mean()
     ema21 = s.ewm(span=21, adjust=False).mean()
     macd = ema9 - ema21
     hist = macd - macd.ewm(span=9, adjust=False).mean()
     delta = s.diff()
-    gain = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
-    loss = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
-    rsi = 100.0 - (100.0 / (1.0 + gain / loss))
+    gain = delta.clip(lower=0).ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1.0 / RSI_PERIOD, adjust=False).mean()
+    rsi = 100.0 - (100.0 / (1.0 + gain / loss.replace(0, 1e-12)))
     mom3 = s - s.shift(3)
     sma = s.rolling(PERIOD).mean()
     std = s.rolling(PERIOD).std()
     width = (2.0 * STD_MULT) * std
     wpc = (width / sma * 100).rolling(50).rank(pct=True) * 100
-    # ADX
-    plus_dm = s.diff().clip(lower=0)
-    minus_dm = (-s.diff()).clip(lower=0)
-    tr = s.diff().abs()
-    atr = tr.rolling(14).mean()
-    plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
-    minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, 1e-12)) * 100
-    adx = dx.rolling(14).mean()
-    # Stochastic
-    low_14 = s.rolling(14).min()
-    high_14 = s.rolling(14).max()
-    stoch_k = 100 * (s - low_14) / (high_14 - low_14).replace(0, 1e-12)
+
+    # True Range + Wilder ATR (backtrader TrueRange / ATR)
+    prev_close = s.shift(1)
+    tr = pd.concat([(high - low),
+                    (high - prev_close).abs(),
+                    (prev_close - low).abs()], axis=1).max(axis=1)
+    alpha = 1.0 / 14.0
+    atr = tr.ewm(alpha=alpha, adjust=False).mean()
+    # Directional Movement (backtrader DirectionalMove): +DI, -DI, ADX
+    up = high.diff()
+    dn = -low.diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=s.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=s.index)
+    natr = atr.replace(0, 1e-12)
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / natr
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / natr
+    dx = ((plus_di - minus_di).abs()
+          / (plus_di + minus_di).replace(0, 1e-12)) * 100.0
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+
+    # Stochastic / Williams %R / pivots use the true 14-bar high-low range
+    low_14 = low.rolling(14).min()
+    high_14 = high.rolling(14).max()
+    rng14 = (high_14 - low_14).replace(0, 1e-12)
+    stoch_k = 100 * (s - low_14) / rng14
     stoch_d = stoch_k.rolling(3).mean()
-    # Williams %R
-    will_r = -100 * (high_14 - s) / (high_14 - low_14).replace(0, 1e-12)
-    # Pivot points for S/R
+    will_r = -100 * (high_14 - s) / rng14
     pivot = (high_14 + low_14 + s) / 3
     r1 = 2 * pivot - low_14
     s1 = 2 * pivot - high_14
     return {"s": s, "ema9": ema9, "ema21": ema21, "hist": hist, "rsi": rsi,
             "mom3": mom3, "wpc": wpc, "sma": sma, "std": std,
-            "adx": adx, "stoch_k": stoch_k, "stoch_d": stoch_d,
+            "adx": adx, "plus_di": plus_di, "minus_di": minus_di, "atr": atr,
+            "stoch_k": stoch_k, "stoch_d": stoch_d,
             "will_r": will_r, "pivot": pivot, "r1": r1, "s1": s1}
 
 
@@ -311,6 +337,41 @@ def _wilson_lower(wins, n, z=1.96):
     return max(0.0, (centre - margin) / denom) * 100.0
 
 
+# ===== validated edge report (from backtest.py --save) =====
+EDGE_REPORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "edge_report.json")
+_EDGE_REPORT = {"mtime": None, "data": {}}
+
+
+def load_edge_report():
+    """Validated per-pair stats written by backtest.py --save (cached by mtime)."""
+    try:
+        m = os.path.getmtime(EDGE_REPORT_FILE)
+    except OSError:
+        _EDGE_REPORT["data"] = {}
+        _EDGE_REPORT["mtime"] = None
+        return {}
+    if _EDGE_REPORT["data"] and _EDGE_REPORT.get("mtime") == m:
+        return _EDGE_REPORT["data"]
+    try:
+        with open(EDGE_REPORT_FILE) as f:
+            d = json.load(f)
+        data = d.get("pairs", d) if isinstance(d, dict) else {}
+    except Exception:
+        data = {}
+    _EDGE_REPORT["mtime"] = m
+    _EDGE_REPORT["data"] = data or {}
+    return _EDGE_REPORT["data"]
+
+
+def edge_from_report(pair, period):
+    """Validated stats for this pair+timeframe, or None."""
+    data = load_edge_report()
+    if not data:
+        return None
+    return data.get(f"{pair}#{int(period)}") or data.get(pair)
+
+
 def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["engine"])
@@ -323,12 +384,14 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
            "full_wins": 0, "full_total": 0, "news_sentiment": 0.0,
            "social_sentiment": 0.0, "volume": "Normal", "confidence_factors": {},
            "tradeable": False, "payout": None, "break_even": None,
-           "wilson": 0.0, "gate_note": ""}
+           "wilson": 0.0, "gate_note": "", "validated": False,
+           "validated_stats": None}
     need = PERIOD + RSI_PERIOD + 6
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
         return out
-    stk = _indicator_stack(closes)
+    ohlc_data = fetch_ohlc(pair, period) if pocket_payout else None
+    stk = _indicator_stack(closes, ohlc_data)
     s = stk["s"]
 
     start = PERIOD + RSI_PERIOD + 4
@@ -349,16 +412,48 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     payout = pair_payout(pair)
     out["payout"] = payout
     be = payout_break_even(payout)
+
+    rep = edge_from_report(pair, period)
+    if be is None and rep is not None:
+        # no live payout - fall back to the payout the backtest validated with
+        be = float(rep.get("break_even") or 0.0) or None
+        if out["payout"] is None and rep.get("payout"):
+            out["payout"] = rep.get("payout")
     out["break_even"] = be
     out["wilson"] = _wilson_lower(f_wins, f_total)
+
     if be is None:
         out["gate_note"] = "Payout unavailable - cannot judge the edge."
+    elif (out["payout"] or 0) < MIN_PAYOUT:
+        out["gate_note"] = (f"Payout {out['payout']:.0f}% is below the "
+                            f"{MIN_PAYOUT:.0f}% minimum.")
+    elif rep is not None:
+        # a validated backtest report exists - trust it over the live replay
+        out["validated"] = True
+        out["validated_stats"] = rep
+        r_bets = int(rep.get("bets", 0))
+        r_exp = float(rep.get("expectancy", 0.0))
+        r_wr = float(rep.get("win_rate", 0.0))
+        r_wil = float(rep.get("wilson", 0.0))
+        out["full_acc"] = r_wr
+        out["full_wins"] = int(rep.get("wins", 0))
+        out["full_total"] = r_bets
+        if r_bets < MIN_BACKTEST_N:
+            out["gate_note"] = (f"Validated on only {r_bets} bets - need "
+                                f"{MIN_BACKTEST_N}.")
+        elif r_exp <= 0:
+            out["gate_note"] = (f"Validated expectancy {r_exp:+.3f}/bet is not "
+                                f"positive.")
+        elif r_wil < be:
+            out["gate_note"] = (f"Validated win {r_wr:.0f}% (Wilson {r_wil:.0f}%) "
+                                f"below break-even {be:.0f}%.")
+        else:
+            out["tradeable"] = True
+            out["gate_note"] = (f"Validated {r_wr:.0f}% win, {r_exp:+.3f}/bet, "
+                                f"SQN {rep.get('sqn', 0)} over {r_bets} bets.")
     elif f_total < MIN_BACKTEST_N:
         out["gate_note"] = (f"Only {f_total} resolved setups - need "
                             f"{MIN_BACKTEST_N} to trust the edge.")
-    elif (payout or 0) < MIN_PAYOUT:
-        out["gate_note"] = (f"Payout {payout:.0f}% is below the "
-                            f"{MIN_PAYOUT:.0f}% minimum.")
     elif out["full_acc"] >= be + EDGE_MARGIN:
         out["tradeable"] = True
         out["gate_note"] = (f"Edge {out['full_acc']:.0f}% beats break-even "
@@ -412,7 +507,6 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     out["ml_score"] = ml_score
     out["confidence_factors"]["ml"] = ml_score
 
-    ohlc_data = fetch_ohlc(pair, period) if pocket_payout else None
     pa_score = _price_action_score(ohlc_data) if ohlc_data else 0.0
     out["price_action"] = pa_score
     out["confidence_factors"]["price_action"] = pa_score
@@ -1723,6 +1817,7 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 Edge: <b>{res.get('full_acc', 0):.0f}%</b> vs break-even "
         f"<b>{(res.get('break_even') or 0):.0f}%</b> "
         f"(payout {(res.get('payout') or 0):.0f}%)\n"
+        f"{_validated_line(res)}"
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
         f"{learn_line}"
@@ -1730,23 +1825,41 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"{now_hm()}"
     )
 
+def _validated_line(res):
+    """One-line summary of a validated backtest report, or ''."""
+    vs = res.get("validated_stats")
+    if not vs:
+        return ""
+    pf = vs.get("profit_factor")
+    pf_txt = f" \u00b7 PF {pf:.2f}" if isinstance(pf, (int, float)) else ""
+    return (f"\U0001f9ea Backtest: <b>{vs.get('win_rate', 0):.0f}%</b> win \u00b7 "
+            f"exp {vs.get('expectancy', 0):+.3f}/bet \u00b7 "
+            f"SQN {vs.get('sqn', 0)} \u00b7 DD {vs.get('max_drawdown_pct', 0):.0f}% "
+            f"({vs.get('bets', 0)} bets{pf_txt})\n")
+
+
 def no_trade_text(res, m, pair, tf_txt):
     edge = res.get("full_acc", 0.0)
     be = res.get("break_even")
     payout = res.get("payout")
     n = res.get("full_total", 0)
     reason = res.get("gate_note") or "No statistical edge right now."
+    src = "Validated edge" if res.get("validated") else "Measured edge"
     lines = [
         f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(fmt_pair(pair))} | {tf_txt}",
         "",
         "This setup does not clear the break-even bar, so no BUY/SELL is issued.",
         "",
-        f"\u2022 Measured edge: <b>{edge:.0f}%</b>"
+        f"\u2022 {src}: <b>{edge:.0f}%</b>"
         + (f" over {n} setups" if n else ""),
         f"\u2022 Break-even needed: <b>{be:.0f}%</b>" if be
         else "\u2022 Break-even: n/a (no payout)",
         f"\u2022 Payout: <b>{payout:.0f}%</b>" if payout
         else "\u2022 Payout: n/a",
+    ]
+    if res.get("validated_stats"):
+        lines.append(_validated_line(res).rstrip("\n"))
+    lines += [
         f"\u2022 Reason: {html.escape(reason)}",
         "",
         now_hm(),

@@ -8,6 +8,7 @@ signal_track.json
 ml_data.json
 ml_models.pkl
 bot_settings.json
+edge_report.json
 _spike_img/
 
 # ---- python ----
