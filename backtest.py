@@ -252,18 +252,28 @@ def summarize(bets, payout_pct, start_bank=100.0, stake=1.0):
     return out
 
 
+def verdict(s):
+    """Mirror the live bot's edge gate so the CLI never contradicts it."""
+    if s["bets"] < 30:
+        return "too few bets"
+    if s["expectancy"] <= 0:
+        return "no edge"
+    if s["wilson"] < s["break_even"]:
+        return "uncertain (Wilson below break-even)"
+    return "POSITIVE"
+
+
 def report(pair, s, period):
     be = s["break_even"]
     edge = s["win_rate"] - be
-    verdict = ("POSITIVE" if s["bets"] >= 30 and s["expectancy"] > 0
-               else "no edge")
+    verdict_txt = verdict(s)
     pf = "inf" if s["profit_factor"] is None else f"{s['profit_factor']:.2f}"
     print(f"\n=== {pair}  ({int(period)}s bars) ===")
     print(f"  bets {s['bets']}  (W {s['wins']} / L {s['losses']} / tie {s['ties']})")
     print(f"  win-rate {s['win_rate']:.1f}%   Wilson95 {s['wilson']:.1f}%   "
           f"break-even {be:.1f}%   (payout {s['payout']:.0f}%)")
     print(f"  expectancy/bet {s['expectancy']:+.3f}u   profit factor {pf}   "
-          f"net {s['net_units']:+.1f}u   -> {verdict}")
+          f"net {s['net_units']:+.1f}u   -> {verdict_txt}")
     print(f"  max drawdown {s['max_drawdown_units']:.1f}u "
           f"({s['max_drawdown_pct']:.1f}%)   streaks W{s['best_win_streak']} "
           f"L{s['worst_loss_streak']}   SQN {s['sqn']}")
