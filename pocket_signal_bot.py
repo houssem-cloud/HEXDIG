@@ -341,7 +341,7 @@ def _fold_edge(stk, params, folds=4):
             "acc": sum(wins) / total * 100.0, "accs": accs}
 
 
-def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
+def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=None):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["engine"])
     pair = pair or sel_pair_default()
@@ -357,7 +357,8 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
         return out
-    ohlc_data = fetch_ohlc(pair, period) if pocket_payout else None
+    ohlc_data = ohlc if ohlc is not None else (fetch_ohlc(pair, period)
+                                               if pocket_payout else None)
     stk = _indicator_stack(closes, ohlc_data)
     s = stk["s"]
 
@@ -1615,10 +1616,15 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         if pay and pay < MIN_PAYOUT:
             continue
         try:
-            closes, note = get_series(pair, period_sec, fetch=True)
-            if note or not closes:
-                continue
-            res = analyze(closes, pair=pair, period=period_sec)
+            ohlc = fetch_ohlc(pair, period_sec)
+            if ohlc and len(ohlc) >= PERIOD + RSI_PERIOD + 6:
+                closes = [r["c"] for r in ohlc]
+            else:
+                closes, note = get_series(pair, period_sec, fetch=True)
+                if note or not closes:
+                    continue
+                ohlc = None
+            res = analyze(closes, pair=pair, period=period_sec, ohlc=ohlc)
             be = res.get("break_even")
             edge = res.get("full_acc", 0.0)
             out.append({
@@ -1651,6 +1657,8 @@ def scan_text(results, period_sec, market):
         lines.append(f"\u2022 {html.escape(fmt_pair(r['pair']))}: "
                      f"<b>{r['edge']:.0f}%</b> vs {be:.0f}% "
                      f"(payout {pay:.0f}%, {tag})")
+    if results[0].get("note"):
+        lines += ["", f"Why the best was refused: {html.escape(results[0]['note'])}"]
     lines += ["", "Closest is still short \u2014 nothing worth risking money on.",
               "", now_hm()]
     return "\n".join(lines)
@@ -1751,10 +1759,11 @@ if __name__ == "__main__":
     STATUS = {"started": time.time(), "last_scan": 0.0, "scan_n": 0,
               "best": None, "last_card": 0.0}
 
-    AUTOSCAN_GAP = 120
+    AUTOSCAN_GAP = 180
     AUTOSCAN_COOLDOWN = 900
-    AUTOSCAN_MAX_PAIRS = 24
-    scan_state = {"running": False, "alerted": {}}
+    AUTOSCAN_MAX_PAIRS = 16
+    scan_lock = threading.Lock()
+    scan_state = {"alerted": {}}
     autoscan = {"on": False, "chat": None, "t": 0.0}
 
     def _emit_signal(chat, pair, period_sec, res, closes):
@@ -1767,15 +1776,14 @@ if __name__ == "__main__":
                   res.get("regime"), features=_feat_last(closes))
 
     def run_scan(chat):
-        if scan_state["running"]:
-            send("A scan is already running \u2014 hang on a moment.", chat_id=chat)
-            return
-        scan_state["running"] = True
         mid = send(f"\U0001f50e Scanning {sel_market.upper()} pairs for a real edge\u2026",
                    chat_id=chat, html_on=True)
 
         def worker():
             nonlocal mid
+            if not scan_lock.acquire(timeout=300):
+                send("A scan is stuck \u2014 try again in a moment.", chat_id=chat)
+                return
             try:
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
                 STATUS["last_scan"] = time.time()
@@ -1812,7 +1820,7 @@ if __name__ == "__main__":
                 else:
                     send(msg, chat_id=chat)
             finally:
-                scan_state["running"] = False
+                scan_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1850,12 +1858,11 @@ if __name__ == "__main__":
                  chat_id=chat, html_on=True)
 
     def autoscan_tick():
-        if scan_state["running"]:
-            return
-        scan_state["running"] = True
         chat = autoscan["chat"]
 
         def worker():
+            if not scan_lock.acquire(blocking=False):
+                return
             try:
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
                 STATUS["last_scan"] = time.time()
@@ -1882,7 +1889,7 @@ if __name__ == "__main__":
             except Exception as e:
                 print("autoscan failed:", e)
             finally:
-                scan_state["running"] = False
+                scan_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2162,6 +2169,8 @@ if __name__ == "__main__":
                     lines.append(f"Last scan: {ago}s ago \u00b7 {STATUS['scan_n']} "
                                  f"pairs \u00b7 best {html.escape(fmt_pair(b['pair']))} "
                                  f"{b['edge']:.0f}% vs {(b['break_even'] or 0):.0f}%")
+                    if b.get("note"):
+                        lines.append(f"Why: {html.escape(b['note'])}")
                 else:
                     lines.append(f"Last scan: {ago}s ago \u00b7 no usable pairs "
                                  "(check payout/SSID)")

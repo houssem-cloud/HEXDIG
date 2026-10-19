@@ -206,6 +206,7 @@ class TestScanner(unittest.TestCase):
         self._mp = bot.market_pairs
         self._gs = bot.get_series
         self._an = bot.analyze
+        self._fo = bot.fetch_ohlc
         self._min = bot.MIN_PAYOUT
         bot.MIN_PAYOUT = 60.0
 
@@ -213,15 +214,18 @@ class TestScanner(unittest.TestCase):
         bot.market_pairs = self._mp
         bot.get_series = self._gs
         bot.analyze = self._an
+        bot.fetch_ohlc = self._fo
         bot.MIN_PAYOUT = self._min
 
     def _wire(self, tradeable_pairs):
         bot.market_pairs = lambda market: [("AAA-OTC", 95.0),
                                            ("BBB-OTC", 50.0),
                                            ("CCC-OTC", 95.0)]
+        bot.fetch_ohlc = lambda pair, period_sec: None
         bot.get_series = lambda pair, period_sec, fetch=True: ([1.0, 1.1, 1.2], "")
 
-        def fake_analyze(closes, model=None, news_symbol=None, pair=None, period=None):
+        def fake_analyze(closes, model=None, news_symbol=None, pair=None,
+                         period=None, ohlc=None):
             tr = pair in tradeable_pairs
             return {"signal": "CALL" if tr else "NO TRADE",
                     "full_acc": 60.0 if tr else 45.0, "full_total": 200,
