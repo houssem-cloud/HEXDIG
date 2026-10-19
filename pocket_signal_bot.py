@@ -323,22 +323,36 @@ def _fold_edge(stk, params, folds=4):
         nxt = float(s.iloc[i + HORIZON])
         wins.append((nxt > c) if sig == "CALL" else (nxt < c))
     total = len(wins)
+    all_wins = sum(wins)
+    all_acc = (all_wins / total * 100.0) if total else 0.0
+    empty = {"wins": 0, "total": 0, "acc": 0.0, "accs": [],
+             "all_wins": 0, "all_total": 0, "all_acc": 0.0, "fold_stats": []}
     if not total:
-        return {"wins": 0, "total": 0, "acc": 0.0, "accs": []}
+        return empty
     k = total // folds if folds >= 2 else 0
     accs = []
+    fold_stats = []
     if k >= 10:
         for f in range(folds):
             lo = f * k
             hi = (f + 1) * k if f < folds - 1 else total
             seg = wins[lo:hi]
-            accs.append(round(sum(seg) / len(seg) * 100.0, 1) if seg else 0.0)
+            w = sum(seg)
+            t = len(seg)
+            acc = (w / t * 100.0) if t else 0.0
+            accs.append(round(acc, 1))
+            fold_stats.append({"wins": w, "total": t, "acc": acc})
         last = wins[-k:]
         if len(last) >= 30:
-            return {"wins": sum(last), "total": len(last),
-                    "acc": sum(last) / len(last) * 100.0, "accs": accs}
-    return {"wins": sum(wins), "total": total,
-            "acc": sum(wins) / total * 100.0, "accs": accs}
+            lw = sum(last)
+            lt = len(last)
+            return {"wins": lw, "total": lt,
+                    "acc": lw / lt * 100.0, "accs": accs,
+                    "all_wins": all_wins, "all_total": total,
+                    "all_acc": all_acc, "fold_stats": fold_stats}
+    return {"wins": all_wins, "total": total, "acc": all_acc, "accs": accs,
+            "all_wins": all_wins, "all_total": total, "all_acc": all_acc,
+            "fold_stats": fold_stats}
 
 
 def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=None):
@@ -350,6 +364,7 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
            "up": None, "lo": None, "wide": False, "depth": 0.0, "model": model,
            "setup": False, "regime": "normal", "horizon": HORIZON,
            "full_acc": 0.0, "full_wins": 0, "full_total": 0, "fold_accs": [],
+           "fold_stats": [],
            "confidence": 0.0, "tradeable": False, "payout": None,
            "break_even": None, "wilson": 0.0, "gate_note": "",
            "validated": False, "validated_stats": None}
@@ -363,10 +378,14 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
     s = stk["s"]
 
     fold = _fold_edge(stk, params)
-    f_wins, f_total = fold["wins"], fold["total"]
-    out["full_wins"], out["full_total"] = f_wins, f_total
-    out["full_acc"] = fold["acc"]
+    all_wins = fold.get("all_wins", fold["wins"])
+    all_total = fold.get("all_total", fold["total"])
+    all_acc = fold.get("all_acc", fold["acc"])
+    f_wins, f_total = all_wins, all_total
+    out["full_wins"], out["full_total"] = all_wins, all_total
+    out["full_acc"] = all_acc
     out["fold_accs"] = fold["accs"]
+    out["fold_stats"] = fold.get("fold_stats", [])
 
     # ---- honest edge gate: does the measured hit-rate beat break-even? ----
     payout = pair_payout(pair)

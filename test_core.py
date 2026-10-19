@@ -58,6 +58,14 @@ class TestFoldEdge(unittest.TestCase):
         if got["total"]:
             self.assertAlmostEqual(got["acc"],
                                    got["wins"] / got["total"] * 100.0, places=6)
+        # the gate needs the whole-sample size, not just the recent fold
+        self.assertGreaterEqual(got["all_total"], got["total"])
+        self.assertGreaterEqual(got["all_wins"], 0)
+        self.assertLessEqual(got["all_wins"], got["all_total"])
+        if got["all_total"]:
+            self.assertAlmostEqual(got["all_acc"],
+                                   got["all_wins"] / got["all_total"] * 100.0,
+                                   places=6)
 
 
 class TestGate(unittest.TestCase):
