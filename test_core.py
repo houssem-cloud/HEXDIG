@@ -158,6 +158,49 @@ class TestFetchCandles(unittest.TestCase):
         self.assertEqual(out, [{"close": 2.0}])
 
 
+class TestReplayGate(unittest.TestCase):
+    """No report present -> the live replay gate must use the Wilson floor."""
+
+    def setUp(self):
+        self._fe = bot._fold_edge
+        self._pp = bot.pair_payout
+        self._rep = bot.EDGE_REPORT_FILE
+        bot.pair_payout = lambda pair: 90.0          # break-even ~52.63
+        bot.EDGE_REPORT_FILE = os.path.join(tempfile.gettempdir(),
+                                            "no_such_edge.json")
+        bot._EDGE_REPORT["data"] = {}
+        bot._EDGE_REPORT["mtime"] = None
+
+    def tearDown(self):
+        bot._fold_edge = self._fe
+        bot.pair_payout = self._pp
+        bot.EDGE_REPORT_FILE = self._rep
+        bot._EDGE_REPORT["data"] = {}
+        bot._EDGE_REPORT["mtime"] = None
+
+    def _fold(self, wins, total, accs):
+        bot._fold_edge = lambda stk, params, folds=4: {
+            "wins": wins, "total": total,
+            "acc": wins / total * 100.0, "accs": accs}
+
+    def test_thin_floor_blocks(self):
+        self._fold(55, 100, [55, 55, 55, 55])   # 55% but floor ~45%
+        res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
+        self.assertFalse(res["tradeable"])
+        self.assertIn("floor", res["gate_note"])
+
+    def test_strong_floor_trades(self):
+        self._fold(70, 100, [70, 70, 70, 70])
+        res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
+        self.assertTrue(res["tradeable"])
+
+    def test_decayed_recent_fold_blocks(self):
+        self._fold(70, 100, [70, 70, 70, 40])   # last fold collapsed
+        res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
+        self.assertFalse(res["tradeable"])
+        self.assertIn("fold", res["gate_note"].lower())
+
+
 class TestScanner(unittest.TestCase):
     def setUp(self):
         self._mp = bot.market_pairs

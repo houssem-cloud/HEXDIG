@@ -402,13 +402,20 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     elif f_total < MIN_BACKTEST_N:
         out["gate_note"] = (f"Only {f_total} resolved setups - need "
                             f"{MIN_BACKTEST_N} to trust the edge.")
-    elif out["full_acc"] >= be + EDGE_MARGIN:
-        out["tradeable"] = True
-        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% beats break-even "
-                            f"{be:.0f}% by {out['full_acc'] - be:.1f}.")
-    else:
+    elif out["full_acc"] < be + EDGE_MARGIN:
         out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above break-even "
                             f"{be:.0f}% (need +{EDGE_MARGIN:.0f}).")
+    elif out["wilson"] < be:
+        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% looks fine but its "
+                            f"95% floor ({out['wilson']:.0f}%) is below break-even "
+                            f"{be:.0f}% - too thin to trust.")
+    elif out["fold_accs"] and out["fold_accs"][-1] < be:
+        out["gate_note"] = (f"Most recent fold {out['fold_accs'][-1]:.0f}% is below "
+                            f"break-even {be:.0f}% - edge not stable.")
+    else:
+        out["tradeable"] = True
+        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% (floor {out['wilson']:.0f}%) "
+                            f"clears break-even {be:.0f}% over {f_total} setups.")
 
     i = len(s) - 1
     out["rsi"] = float(stk["rsi"].iloc[i]) if not pd.isna(stk["rsi"].iloc[i]) else None
@@ -1697,7 +1704,7 @@ if __name__ == "__main__":
     auto_on = False
     CURRENT_MODEL = sel_model
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
-    MIN_BACKTEST_N = int(S.get("min_backtest_n", MIN_BACKTEST_N))
+    MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     update_offset = None
     owner_id = None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)
