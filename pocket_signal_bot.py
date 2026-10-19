@@ -1775,6 +1775,7 @@ if __name__ == "__main__":
                    chat_id=chat, html_on=True)
 
         def worker():
+            nonlocal mid
             try:
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
                 STATUS["last_scan"] = time.time()
