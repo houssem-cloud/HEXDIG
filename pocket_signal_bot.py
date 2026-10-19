@@ -1707,6 +1707,7 @@ HELP_TEXT = (
     "/scan - Scan every pair for a real edge now\n"
     "/auto - Toggle continuous auto-scan alerts\n"
     "/amount N - Set the stake for accepted signals\n"
+    "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
     "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
     "Tap Find a trade to scan all pairs and get pinged only when one clears "
@@ -1747,6 +1748,9 @@ if __name__ == "__main__":
     watch = {"on": False, "chat": None, "msg": None, "t": 0.0, "alert": 0.0,
              "last_sig": None}
 
+    STATUS = {"started": time.time(), "last_scan": 0.0, "scan_n": 0,
+              "best": None, "last_card": 0.0}
+
     AUTOSCAN_GAP = 120
     AUTOSCAN_COOLDOWN = 900
     AUTOSCAN_MAX_PAIRS = 24
@@ -1757,6 +1761,7 @@ if __name__ == "__main__":
         m = tech_metrics(closes, fetch_ohlc(pair, period_sec), res)
         mid = send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
                    keyboard=kb_signal(), html_on=True)
+        STATUS["last_card"] = time.time()
         remember_signal(mid, res, pair, period_sec, m.get("price"))
         track_add(pair, period_sec, res["signal"], m.get("price"), sel_model,
                   res.get("regime"), features=_feat_last(closes))
@@ -1772,8 +1777,12 @@ if __name__ == "__main__":
         def worker():
             try:
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
+                STATUS["last_scan"] = time.time()
+                STATUS["scan_n"] = len(results)
+                STATUS["best"] = results[0] if results else None
                 best = next((r for r in results if r["tradeable"]), None)
                 if best:
+                    STATUS["last_card"] = time.time()
                     res, closes = best["res"], best["closes"]
                     m = tech_metrics(closes, fetch_ohlc(best["pair"], sel_time), res)
                     cap = autoscan_card_text(res, m, best["pair"], tf_label(sel_time))
@@ -1848,6 +1857,17 @@ if __name__ == "__main__":
         def worker():
             try:
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
+                STATUS["last_scan"] = time.time()
+                STATUS["scan_n"] = len(results)
+                STATUS["best"] = results[0] if results else None
+                if results:
+                    top = results[0]
+                    print(f"[autoscan] {len(results)} pairs, best "
+                          f"{top['pair']} {top['edge']:.0f}% vs "
+                          f"{top['break_even'] or 0:.0f}% "
+                          f"({'TRADEABLE' if top['tradeable'] else 'no edge'})")
+                else:
+                    print("[autoscan] no usable pairs")
                 now = time.time()
                 for r in results:
                     if not r["tradeable"]:
@@ -1992,6 +2012,8 @@ if __name__ == "__main__":
             reveal(GEN_PCT[idx])
         time.sleep(0.4)
         ok = send_result(res, chat, m, conf, closes)
+        if ok:
+            STATUS["last_card"] = time.time()
         if ok and res.get("signal") in ("CALL", "PUT"):
             track_add(sel_pair, sel_time, res["signal"], m.get("price"),
                       sel_model, res.get("regime"),
@@ -2119,6 +2141,45 @@ if __name__ == "__main__":
             autoscan["t"] = 0.0
             send(f"\U0001f501 Auto-scan {'ON' if autoscan['on'] else 'OFF'}.",
                  chat_id=chat)
+        elif cmd in ("/status", "status"):
+            up = int(time.time() - STATUS["started"])
+            h, rem = divmod(up, 3600)
+            mnt = rem // 60
+            lines = ["\U0001f4e1 <b>Status</b>",
+                     f"Uptime: {h}h {mnt}m",
+                     f"Market: {sel_market.upper()} \u00b7 {tf_label(sel_time)} "
+                     f"\u00b7 {html.escape(fmt_pair(sel_pair))}",
+                     f"Auto-scan: {'ON' if autoscan['on'] else 'off'}",
+                     f"Watch: {'ON' if watch['on'] else 'off'}",
+                     "Trading: " + ("ENABLED (real orders)"
+                                    if os.getenv("ALLOW_TRADING") == "1"
+                                    else "display-only (Accept is disabled)")]
+            if STATUS["last_scan"]:
+                ago = int(time.time() - STATUS["last_scan"])
+                b = STATUS["best"]
+                if b:
+                    lines.append(f"Last scan: {ago}s ago \u00b7 {STATUS['scan_n']} "
+                                 f"pairs \u00b7 best {html.escape(fmt_pair(b['pair']))} "
+                                 f"{b['edge']:.0f}% vs {(b['break_even'] or 0):.0f}%")
+                else:
+                    lines.append(f"Last scan: {ago}s ago \u00b7 no usable pairs "
+                                 "(check payout/SSID)")
+            else:
+                lines.append("Last scan: none yet \u2014 tap Find a trade")
+            if pocket_payout is not None:
+                try:
+                    st, age = pocket_payout.feed_status(sel_pair, sel_time)
+                    lines.append("Feed: " + st +
+                                 (f" ({age:.0f}s)" if age else ""))
+                except Exception:
+                    pass
+                try:
+                    bal = pocket_payout.account_balance()
+                    if bal is not None:
+                        lines.append(f"Balance: {bal:.2f}")
+                except Exception:
+                    pass
+            send("\n".join(lines), chat_id=chat, html_on=True)
         elif cmd in ("/help", "help"):
             send(HELP_TEXT, chat_id=chat)
 
