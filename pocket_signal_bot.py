@@ -494,8 +494,6 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     out["confidence_factors"]["volume"] = vol_data["vol_pct"]
 
     price = float(stk["s"].iloc[i])
-    r1 = stk["r1"].iloc[i] if not pd.isna(stk["r1"].iloc[i]) else None
-    s1 = stk["s1"].iloc[i] if not pd.isna(stk["s1"].iloc[i]) else None
     if out["up"] and out["lo"]:
         pos = float((price - out["lo"]) / (out["up"] - out["lo"]) * 100.0)
         pos = max(0.0, min(100.0, pos))
@@ -1683,8 +1681,7 @@ def sparkline(vals):
 
 def tech_metrics(closes, ohlc, res):
     out = {"vol": "Normal", "vol_pct": 50.0, "rsi_label": "Neutral", "macd": "Neutral",
-           "ma": "Sideways", "sentiment": "Sideways pressure", "asset_strength": 50.0,
-           "volume_result": 50.0, "r1": None, "s1": None, "price": None,
+           "ma": "Sideways", "sentiment": "Sideways pressure", "price": None,
            "strength_label": "Moderate", "conditions": "Favorable",
            "news_sentiment": 0.0, "social_sentiment": 0.0}
     if not closes or len(closes) < 30:
@@ -1734,27 +1731,7 @@ def tech_metrics(closes, ohlc, res):
     elif float(ema9.iloc[i]) < float(ema21.iloc[i]):
         out["sentiment"] = "Downward pressure"
 
-    if ohlc and len(ohlc) >= 20:
-        rows = ohlc[-20:]
-    else:
-        rows = [{"o": closes[-k - 1], "c": closes[-k],
-                 "h": max(closes[-k - 1], closes[-k]), "l": min(closes[-k - 1], closes[-k])}
-                for k in range(min(20, len(closes) - 1))]
-    ranges = [max(r["h"] - r["l"], 1e-12) for r in rows]
-    bodies = [r["c"] - r["o"] for r in rows]
-    tot = sum(ranges) or 1e-12
-    out["asset_strength"] = abs(sum(bodies)) / tot * 100.0
-    want_up = res.get("signal") == "CALL"
-    out["volume_result"] = (sum(rg for rg, b in zip(ranges, bodies)
-                                if (b > 0) == want_up) / tot) * 100.0
-
-    hh = max(r["h"] for r in rows)
-    ll = min(r["l"] for r in rows)
-    cc = float(s.iloc[i])
-    p = (hh + ll + cc) / 3.0
-    out["r1"] = 2 * p - ll
-    out["s1"] = 2 * p - hh
-    out["price"] = cc
+    out["price"] = float(s.iloc[i])
 
     conf = gate_score(res)
     out["strength_label"] = ("Strong" if conf >= 70 else
@@ -1801,13 +1778,9 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
         f"\U0001fab6 Market info:\n"
         f"\u2022 Volatility: <b>{m['vol']}</b>\n"
-        f"\u2022 Asset strength by volume: <b>{m['asset_strength']:.0f}%</b>\n"
-        f"\u2022 Volume result: <b>{m['volume_result']:.0f}%</b>\n"
         f"\u2022 Sentiment: <b>{m['sentiment']}</b>\n\n"
         f"\U0001f9ed Technical overview:\n"
         f"\u2022 Current price: <b>{price(m['price'])} {mkt}</b>\n"
-        f"\u2022 Resistance (R1): <b>{price(m['r1'])}</b>\n"
-        f"\u2022 Support (S1): <b>{price(m['s1'])}</b>\n"
         f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
         f"\u2022 MACD: <b>{m['macd']}</b>\n"
         f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
@@ -1890,9 +1863,8 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     return True
 
 GEN_STEPS = ["Volatility scan", "RSI Analysis", "MACD Status", "Moving Average",
-             "Asset Power", "Volume Analysis", "Resistance", "Support",
              "Signal Accuracy"]
-GEN_PCT = [12, 28, 39, 50, 61, 70, 80, 90, 100]
+GEN_PCT = [15, 35, 55, 75, 100]
 
 def gen_text(pct, values):
     filled = max(0, min(5, (pct + 19) // 20))
@@ -2063,10 +2035,6 @@ if __name__ == "__main__":
              else m["rsi_label"]),
             m["macd"],
             m["ma"],
-            f"{m['asset_strength']:.0f}%",
-            f"{m['volume_result']:.0f}%",
-            f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
-            f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
             f"{res.get('full_acc', 0):.0f}% ({res.get('full_total', 0)} past signals)",
         ]
         for idx, val in enumerate(reveal_vals):
