@@ -283,6 +283,24 @@ class TestAcceptRegistry(unittest.TestCase):
         bot.PENDING_SIGNALS.clear()
 
 
+class TestAcceptButton(unittest.TestCase):
+    def test_payload_fits_telegram_limit_and_parses(self):
+        kb = bot.kb_signal_ctx("BCHNZD-OTC", "SELL", 60, 1700000000)
+        cb = kb[0][0]["callback_data"]
+        self.assertLessEqual(len(cb.encode("utf-8")), 64)
+        self.assertTrue(cb.startswith("acc:"))
+        parts = cb.split(":")
+        self.assertEqual(parts[1], "BCHNZD-OTC")
+        self.assertEqual(parts[2], "SELL")
+        self.assertEqual(parts[3], "60")
+        self.assertEqual(parts[4], "1700000000")
+
+    def test_long_pair_drops_timestamp_to_fit(self):
+        pair = "VERYLONGPAIRNAME-OTC"
+        cb = bot.kb_signal_ctx(pair, "CALL", 60, 1700000000)[0][0]["callback_data"]
+        self.assertLessEqual(len(cb.encode("utf-8")), 64)
+
+
 class TestThrottleRetry(unittest.TestCase):
     def test_throttle_nonblocking_window(self):
         import pocket_payout as pp

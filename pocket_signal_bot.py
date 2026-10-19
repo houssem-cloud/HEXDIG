@@ -1444,9 +1444,22 @@ def kb_times():
     rows.append([{"text": "Back", "callback_data": "ui:pairback"}])
     return rows
 
-def kb_signal():
-    return [[{"text": "\u2705 Accept signal", "callback_data": "sig:accept"}],
+def kb_signal_ctx(pair, signal, period_sec, ts=None):
+    """Signal card keyboard whose Accept button carries its own context, so it
+    still works after a bot restart (no in-memory state to lose)."""
+    ts = int(ts if ts is not None else time.time())
+    cb = f"acc:{pair}:{signal}:{int(period_sec)}:{ts}"
+    if len(cb.encode("utf-8")) > 64:
+        cb = f"acc:{pair}:{signal}:{int(period_sec)}"
+    return [[{"text": "\u2705 Accept signal", "callback_data": cb}],
             [{"text": "\U0001f504 Another signal", "callback_data": "sig:again"},
+             {"text": "\U0001f50e Find a trade", "callback_data": "scan:run"}],
+            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+
+
+def kb_signal():
+    """Navigation-only keyboard for cards that carry no actionable signal."""
+    return [[{"text": "\U0001f504 Another signal", "callback_data": "sig:again"},
              {"text": "\U0001f50e Find a trade", "callback_data": "scan:run"}],
             [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
@@ -1698,7 +1711,9 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     path = header_image(pair, res["signal"], closes)
     if path:
         try:
-            mid = send_photo(path, cap, chat_id=chat, keyboard=kb_signal(), html_on=True)
+            mid = send_photo(path, cap, chat_id=chat,
+                             keyboard=kb_signal_ctx(pair, res["signal"], sel_time),
+                             html_on=True)
         finally:
             try:
                 os.remove(path)
@@ -1711,7 +1726,8 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     dot = "\U0001f7e2" if buy else "\U0001f534"
     mid = send(f"{dot} <b>{'BUY' if buy else 'SELL'}</b> - "
                f"{html.escape(fmt_pair(pair))} | {tf_txt}\n\n{cap}",
-               chat_id=chat, keyboard=kb_signal(), html_on=True)
+               chat_id=chat,
+               keyboard=kb_signal_ctx(pair, res["signal"], sel_time), html_on=True)
     remember_signal(mid, res, pair, sel_time, m.get("price"))
     return mid
 
@@ -1788,7 +1804,8 @@ if __name__ == "__main__":
     def _emit_signal(chat, pair, period_sec, res, closes):
         m = tech_metrics(closes, fetch_ohlc(pair, period_sec), res)
         mid = send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
-                   keyboard=kb_signal(), html_on=True)
+                   keyboard=kb_signal_ctx(pair, res["signal"], period_sec),
+                   html_on=True)
         STATUS["last_card"] = time.time()
         remember_signal(mid, res, pair, period_sec, m.get("price"))
         track_add(pair, period_sec, res["signal"], m.get("price"), sel_model,
@@ -1820,9 +1837,15 @@ if __name__ == "__main__":
                         edit(txt, chat, mid, html_on=True)
                         api_call("editMessageReplyMarkup", {"chat_id": chat,
                                  "message_id": mid,
-                                 "reply_markup": {"inline_keyboard": kb_signal()}})
+                                 "reply_markup": {"inline_keyboard":
+                                                  kb_signal_ctx(best["pair"],
+                                                                res["signal"],
+                                                                sel_time)}})
                     else:
-                        mid = send(txt, chat_id=chat, keyboard=kb_signal(), html_on=True)
+                        mid = send(txt, chat_id=chat,
+                                   keyboard=kb_signal_ctx(best["pair"],
+                                                          res["signal"], sel_time),
+                                   html_on=True)
                     remember_signal(mid, res, best["pair"], sel_time, m.get("price"))
                     track_add(best["pair"], sel_time, res["signal"], m.get("price"),
                               sel_model, res.get("regime"), features=_feat_last(closes))
@@ -1843,10 +1866,22 @@ if __name__ == "__main__":
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def accept_signal(chat, ctx, mid):
-        if not ctx:
-            send("This signal has expired \u2014 ask for a fresh one.", chat_id=chat)
+    def accept_signal(chat, pair, signal, period, ts=0):
+        if signal not in ("CALL", "PUT") or not pair:
+            send("This button carries no signal \u2014 ask for a fresh one.",
+                 chat_id=chat)
             return
+        try:
+            period = int(period)
+        except Exception:
+            period = int(sel_time)
+        if ts:
+            age = time.time() - int(ts)
+            if age > max(120, period * 2):
+                send(f"\u231b <b>Signal expired</b> \u2014 it is {int(age)}s old, "
+                     f"past the {tf_label(period)} expiry. Ask for a fresh one.",
+                     chat_id=chat, html_on=True)
+                return
         if pocket_payout is None:
             send("Live trading is unavailable on this host (library not loaded).",
                  chat_id=chat)
@@ -1854,22 +1889,20 @@ if __name__ == "__main__":
         if os.getenv("ALLOW_TRADING") != "1":
             send("\U0001f512 <b>Accept is disabled.</b> Restart the bot with "
                  "ALLOW_TRADING=1 to allow real orders.\n\nSignal: "
-                 f"{ctx['signal']} {html.escape(fmt_pair(ctx['pair']))} \u00b7 "
-                 f"{tf_label(ctx['period'])}", chat_id=chat, html_on=True)
+                 f"{signal} {html.escape(fmt_pair(pair))} \u00b7 "
+                 f"{tf_label(period)}", chat_id=chat, html_on=True)
             return
         amount = TRADE_AMOUNT
-        ok, msg = pocket_payout.place_trade(ctx["pair"], ctx["signal"], amount,
-                                            ctx["period"])
+        ok, msg = pocket_payout.place_trade(pair, signal, amount, period)
         if ok:
-            PENDING_SIGNALS.pop(mid, None)
             bal = None
             try:
                 bal = pocket_payout.account_balance()
             except Exception:
                 pass
             extra = f"\nBalance: {bal:.2f}" if bal is not None else ""
-            send(f"\u2705 <b>Order placed</b>\n{ctx['signal']} "
-                 f"{html.escape(fmt_pair(ctx['pair']))} \u00b7 {tf_label(ctx['period'])} "
+            send(f"\u2705 <b>Order placed</b>\n{signal} "
+                 f"{html.escape(fmt_pair(pair))} \u00b7 {tf_label(period)} "
                  f"\u00b7 stake {amount:g}\nTicket: {html.escape(str(msg))}{extra}",
                  chat_id=chat, html_on=True)
         else:
@@ -2105,9 +2138,23 @@ if __name__ == "__main__":
                 run_generation(chat)
             elif data == "sig:again":
                 run_generation(chat)
+            elif data.startswith("acc:"):
+                parts = data.split(":")
+                if len(parts) >= 4:
+                    ts = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+                    accept_signal(chat, parts[1], parts[2], parts[3], ts)
+                else:
+                    send("This signal button is invalid \u2014 request a fresh one.",
+                         chat_id=chat)
             elif data == "sig:accept":
                 mid = cb.get("message", {}).get("message_id")
-                accept_signal(chat, PENDING_SIGNALS.get(mid), mid)
+                ctx = PENDING_SIGNALS.get(mid)
+                if ctx:
+                    accept_signal(chat, ctx["pair"], ctx["signal"],
+                                  ctx["period"], ctx.get("ts", 0))
+                else:
+                    send("This signal has expired \u2014 ask for a fresh one.",
+                         chat_id=chat)
             elif data == "scan:run":
                 run_scan(chat)
             elif data == "scan:toggle":
