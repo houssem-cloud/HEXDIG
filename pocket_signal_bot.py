@@ -2067,7 +2067,7 @@ if __name__ == "__main__":
             f"{m['volume_result']:.0f}%",
             f"{m['r1']:.5f}" if m["r1"] is not None else "n/a",
             f"{m['s1']:.5f}" if m["s1"] is not None else "n/a",
-            f"{conf:.0f}% ({res.get('full_total', 0)} past signals)",
+            f"{res.get('full_acc', 0):.0f}% ({res.get('full_total', 0)} past signals)",
         ]
         for idx, val in enumerate(reveal_vals):
             values.append(val)
