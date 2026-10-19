@@ -11,8 +11,13 @@ import unittest
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# work whether this file sits at the repo root or inside a tests/ folder
+for _d in (_HERE, os.path.dirname(_HERE)):
+    if os.path.exists(os.path.join(_d, "pocket_signal_bot.py")):
+        if _d not in sys.path:
+            sys.path.insert(0, _d)
+        break
 
 import pocket_signal_bot as bot
 
@@ -107,6 +112,50 @@ class TestGate(unittest.TestCase):
         self.assertFalse(res["tradeable"])
         self.assertEqual(res["signal"], "NO TRADE")
         self.assertIn("decayed", res["gate_note"])
+
+
+class TestFetchCandles(unittest.TestCase):
+    def test_prefers_legacy_get_candles(self):
+        import pocket_payout
+        seen = {}
+
+        class Api:
+            def get_candles(self, sym, period, count):
+                seen["legacy"] = True
+                return [{"close": 1.0}]
+
+            def get_candles_live(self, *a, **k):
+                raise AssertionError("live path must not run when legacy works")
+
+        out = pocket_payout._fetch_candles(Api(), "EURUSD", 60, 10)
+        self.assertTrue(seen.get("legacy"))
+        self.assertEqual(out, [{"close": 1.0}])
+
+    def test_falls_back_to_live_when_legacy_gone(self):
+        import pocket_payout
+
+        class Iterator:
+            def __init__(self):
+                self.calls = 0
+
+            def __next__(self):
+                self.calls += 1
+                if self.calls > 1:
+                    raise StopIteration
+                return ([{"close": 2.0}], None)
+
+            def stop(self):
+                pass
+
+        class Api:
+            def get_candles(self, *a, **k):
+                raise RuntimeError("removed in this version")
+
+            def get_candles_live(self, *a, **k):
+                return Iterator()
+
+        out = pocket_payout._fetch_candles(Api(), "EURUSD", 60, 10)
+        self.assertEqual(out, [{"close": 2.0}])
 
 
 class TestSafety(unittest.TestCase):

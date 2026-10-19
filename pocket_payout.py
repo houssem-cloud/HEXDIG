@@ -169,6 +169,30 @@ def get_payout(asset, default=None):
     return v if v is not None else default
 
 
+def _fetch_candles(api, sym, period, count):
+    """Historical candles, version-proof.
+
+    Uses the legacy `get_candles` (fast, non-blocking) while it exists, and
+    transparently falls back to the non-deprecated live backfill
+    (`get_candles_live`) once the library removes it. Never leaves a hang: the
+    live path is only tried after the legacy call fails."""
+    count = int(count)
+    legacy = getattr(api, "get_candles", None)
+    if legacy is not None:
+        try:
+            return legacy(sym, int(period), count)
+        except Exception:
+            pass
+    hours = max(1.0, (int(period) * count) / 3600.0 * 1.25)
+    it = api.get_candles_live(sym, int(period), hours=hours, max_rows=count)
+    closed, _forming = next(it)
+    try:
+        it.stop()
+    except Exception:
+        pass
+    return list(closed or [])
+
+
 def get_closes(asset, period=60, offset=200, ttl=_CLOSES_TTL):
     """Real closes for an asset+timeframe, or None if unavailable. Never raises."""
     key = f"{_norm(asset)}#{int(period)}"
@@ -182,7 +206,7 @@ def get_closes(asset, period=60, offset=200, ttl=_CLOSES_TTL):
             return list(cached[1]) if cached else None
         sym = feed_symbol(_norm(asset))
         try:
-            data = api.get_candles(sym, period, offset)
+            data = _fetch_candles(api, sym, period, offset)
         except Exception:
             _reset_client()
             return list(cached[1]) if cached else None
@@ -220,7 +244,7 @@ def get_ohlcv(asset, period=60, offset=220, ttl=_CLOSES_TTL):
             return [dict(r) for r in cached[1]] if cached else None
         sym = feed_symbol(_norm(asset))
         try:
-            data = api.get_candles(sym, int(period), int(offset))
+            data = _fetch_candles(api, sym, period, offset)
         except Exception:
             _reset_client()
             return [dict(r) for r in cached[1]] if cached else None

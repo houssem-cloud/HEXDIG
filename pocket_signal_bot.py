@@ -797,7 +797,7 @@ def _settle_price(pair, tfi, expire_ts):
             api = pocket_payout._ensure_client()
             if api is not None:
                 sym = pocket_payout.feed_symbol(pocket_payout._norm(pair))
-                raw = api.get_candles(sym, tfi, 60) or []
+                raw = pocket_payout._fetch_candles(api, sym, tfi, 60) or []
         if raw:
             for row in raw:
                 try:
@@ -892,7 +892,7 @@ def _acct_raw(asset, open_ts):
         sym = pocket_payout.feed_symbol(pocket_payout._norm(asset))
         for period in (60, 300, 900, 1800):
             try:
-                raw = api.get_candles(sym, period, 144) or []
+                raw = pocket_payout._fetch_candles(api, sym, period, 144) or []
             except Exception:
                 raw = []
             if not raw:
