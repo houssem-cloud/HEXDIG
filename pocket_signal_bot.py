@@ -31,70 +31,6 @@ import pandas as pd
 import numpy as np
 from collections import deque
 
-# ===== NEWS & SENTIMENT =====
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
-SOCIAL_SENTIMENT_WEIGHT = 0.3
-
-def fetch_news_sentiment(symbol, hours=24):
-    """Fetch recent news and return sentiment score (-1 to 1)."""
-    try:
-        if NEWS_API_KEY:
-            url = "https://newsapi.org/v2/everything"
-            params = {
-                "q": symbol,
-                "from": (datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%d"),
-                "to": datetime.datetime.utcnow().strftime("%Y-%m-%d"),
-                "language": "en",
-                "sortBy": "publishedAt",
-                "pageSize": 10,
-                "apiKey": NEWS_API_KEY
-            }
-            r = requests.get(url, params=params, timeout=10)
-            if r.status_code == 200 and r.json().get("status") == "ok":
-                articles = r.json().get("articles", [])
-                if not articles:
-                    return 0.0
-                score = 0.0
-                for art in articles:
-                    title = art.get("title", "").lower()
-                    desc = art.get("description", "").lower()
-                    text = title + " " + desc
-                    neg_words = ["fall", "drop", "decline", "crash", "risk", "warn", "alert"]
-                    pos_words = ["rise", "gain", "increase", "boost", "positive", "growth", "record"]
-                    n = sum(1 for w in neg_words if w in text)
-                    p = sum(1 for w in pos_words if w in text)
-                    score += (p - n)
-                return max(-1.0, min(1.0, score / len(articles) / 3.0))
-    except Exception:
-        pass
-    return 0.0
-
-def fetch_social_sentiment(symbol, platform="twitter"):
-    """Fetch social media mentions sentiment."""
-    try:
-        if platform == "twitter":
-            return 0.0
-        elif platform == "reddit":
-            return 0.0
-        elif platform == "telegram":
-            return 0.0
-    except Exception:
-        pass
-    return 0.0
-
-class SentimentCache:
-    def __init__(self):
-        self.cache = {}
-        self.ttl = 300
-    def get(self, key):
-        if key in self.cache and time.time() - self.cache[key]["ts"] < self.ttl:
-            return self.cache[key]["score"]
-        return None
-    def set(self, key, score):
-        self.cache[key] = {"score": score, "ts": time.time()}
-
-sentiment_cache = SentimentCache()
-
 # ===== CONFIG =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PASTE_CHAT_ID_NUMBER")
@@ -112,16 +48,15 @@ SQUEEZE_PCT = 40
 
 # ---- honest edge gate (tunable via pocket_settings.json) ----
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
-MIN_BACKTEST_N = 40    # minimum resolved setups before the edge is trusted
+MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
 
-# Single engine: one transparent rule vote + one walk-forward-validated
-# classifier used as confirmation. The previous six "models" were cosmetic
-# weight variants with no measured edge, so they were removed.
+# Single engine: one transparent rule vote, gated by that same rule's measured
+# out-of-sample hit-rate vs. the payout break-even. The previous six "models"
+# were cosmetic weight variants with no measured edge, so they were removed.
 ENGINE_WEIGHTS = (2, 2, 1, 1)
 MODEL_PARAMS = {
-    "engine": {"w": ENGINE_WEIGHTS, "squeeze_acc": 50.0, "normal_acc": 50.0,
-               "label": "Rule vote + validated classifier"},
+    "engine": {"w": ENGINE_WEIGHTS, "label": "Rule vote + validated edge gate"},
 }
 MODELS = ["engine"]
 MODEL_NAMES = {"engine": "Engine"}
@@ -284,27 +219,6 @@ def decide_at(stk, i, params):
     return _votes(stk, i, params["w"])
 
 
-def _compute_volume(closes):
-    """Scale-free volatility percentile (FX/OTC has no real volume)."""
-    if not closes or len(closes) < 30:
-        return {"vol": "Normal", "vol_pct": 50.0}
-    ret = pd.Series([float(x) for x in closes]).pct_change().abs().dropna()
-    if len(ret) < 20:
-        return {"vol": "Normal", "vol_pct": 50.0}
-    window = ret.iloc[-100:]
-    cur = float(window.iloc[-1])
-    vol_pct = float((window < cur).mean() * 100.0)
-    if vol_pct >= 75:
-        vol_label = "High (breakout)"
-    elif vol_pct >= 50:
-        vol_label = "Increased"
-    elif vol_pct >= 25:
-        vol_label = "Normal"
-    else:
-        vol_label = "Low (range)"
-    return {"vol": vol_label, "vol_pct": vol_pct}
-
-
 def pair_payout(pair):
     """Current payout % for an asset, or None. Never raises."""
     if pocket_payout is None:
@@ -372,20 +286,53 @@ def edge_from_report(pair, period):
     return data.get(f"{pair}#{int(period)}") or data.get(pair)
 
 
+def _fold_edge(stk, params, folds=4):
+    """Replay the rule causally and score it per fold.
+
+    Returns the *most recent* fold's stats as the gate input when that fold has
+    enough samples (so a decayed edge is caught), otherwise the whole sample.
+    `accs` lists every fold's hit-rate for a stability check."""
+    s = stk["s"]
+    start = PERIOD + RSI_PERIOD + 4
+    wins = []
+    for i in range(start, len(s) - HORIZON):
+        sig = decide_at(stk, i, params)
+        if not sig:
+            continue
+        c = float(s.iloc[i])
+        nxt = float(s.iloc[i + HORIZON])
+        wins.append((nxt > c) if sig == "CALL" else (nxt < c))
+    total = len(wins)
+    if not total:
+        return {"wins": 0, "total": 0, "acc": 0.0, "accs": []}
+    k = total // folds if folds >= 2 else 0
+    accs = []
+    if k >= 10:
+        for f in range(folds):
+            lo = f * k
+            hi = (f + 1) * k if f < folds - 1 else total
+            seg = wins[lo:hi]
+            accs.append(round(sum(seg) / len(seg) * 100.0, 1) if seg else 0.0)
+        last = wins[-k:]
+        if len(last) >= 30:
+            return {"wins": sum(last), "total": len(last),
+                    "acc": sum(last) / len(last) * 100.0, "accs": accs}
+    return {"wins": sum(wins), "total": total,
+            "acc": sum(wins) / total * 100.0, "accs": accs}
+
+
 def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["engine"])
     pair = pair or sel_pair_default()
     period = int(period or 60)
-    out = {"signal": "WAIT", "accuracy": 0.0, "note": "", "rsi": None,
+    out = {"signal": "WAIT", "note": "", "rsi": None,
            "up": None, "lo": None, "wide": False, "depth": 0.0, "model": model,
            "setup": False, "regime": "normal", "horizon": HORIZON,
-           "measured": params["normal_acc"], "full_acc": 0.0,
-           "full_wins": 0, "full_total": 0, "news_sentiment": 0.0,
-           "social_sentiment": 0.0, "volume": "Normal", "confidence_factors": {},
-           "tradeable": False, "payout": None, "break_even": None,
-           "wilson": 0.0, "gate_note": "", "validated": False,
-           "validated_stats": None}
+           "full_acc": 0.0, "full_wins": 0, "full_total": 0, "fold_accs": [],
+           "confidence": 0.0, "tradeable": False, "payout": None,
+           "break_even": None, "wilson": 0.0, "gate_note": "",
+           "validated": False, "validated_stats": None}
     need = PERIOD + RSI_PERIOD + 6
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
@@ -394,19 +341,11 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     stk = _indicator_stack(closes, ohlc_data)
     s = stk["s"]
 
-    start = PERIOD + RSI_PERIOD + 4
-    f_wins = f_total = 0
-    for i in range(start, len(s) - HORIZON):
-        sig = decide_at(stk, i, params)
-        if not sig:
-            continue
-        c = s.iloc[i]
-        nxt = s.iloc[i + HORIZON]
-        f_total += 1
-        if (nxt > c) if sig == "CALL" else (nxt < c):
-            f_wins += 1
+    fold = _fold_edge(stk, params)
+    f_wins, f_total = fold["wins"], fold["total"]
     out["full_wins"], out["full_total"] = f_wins, f_total
-    out["full_acc"] = (f_wins / f_total * 100.0) if f_total else 0.0
+    out["full_acc"] = fold["acc"]
+    out["fold_accs"] = fold["accs"]
 
     # ---- honest edge gate: does the measured hit-rate beat break-even? ----
     payout = pair_payout(pair)
@@ -438,6 +377,12 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
         out["full_acc"] = r_wr
         out["full_wins"] = int(rep.get("wins", 0))
         out["full_total"] = r_bets
+        out["wilson"] = r_wil
+        folds = rep.get("folds") or []
+        last = folds[-1] if folds else None
+        lw = float(last.get("wilson", 0.0)) if last else 0.0
+        lexp = float(last.get("expectancy", 0.0)) if last else 0.0
+        lbets = int(last.get("bets", 0)) if last else 0
         if r_bets < MIN_BACKTEST_N:
             out["gate_note"] = (f"Validated on only {r_bets} bets - need "
                                 f"{MIN_BACKTEST_N}.")
@@ -447,6 +392,9 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
         elif r_wil < be:
             out["gate_note"] = (f"Validated win {r_wr:.0f}% (Wilson {r_wil:.0f}%) "
                                 f"below break-even {be:.0f}%.")
+        elif last and lbets >= 20 and (lexp <= 0 or lw < be):
+            out["gate_note"] = (f"Recent fold decayed: {last.get('win_rate', 0):.0f}% "
+                                f"win, {lexp:+.3f}/bet - edge not stable.")
         else:
             out["tradeable"] = True
             out["gate_note"] = (f"Validated {r_wr:.0f}% win, {r_exp:+.3f}/bet, "
@@ -471,63 +419,13 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None):
     out["lo"] = float(lo.iloc[i]) if not pd.isna(lo.iloc[i]) else None
     out["regime"] = regime_at(stk, i)
     out["wide"] = out["regime"] in ("wide",)
-    out["measured"] = (params["squeeze_acc"] if out["regime"] == "squeeze"
-                       else params["normal_acc"])
     out["setup"] = out["regime"] == "squeeze"
     out["note"] = ("Quiet market - the regime with the best measured edge."
                    if out["setup"] else "Normal volatility - accuracy near a coin flip.")
 
-    news_s = 0.0
-    social_s = 0.0
-    if news_symbol:
-        news_s = fetch_news_sentiment(news_symbol, hours=24)
-        out["news_sentiment"] = news_s
-        sentiment_cache.set(f"news:{news_symbol}", news_s)
-    social_s = fetch_social_sentiment(news_symbol or "EURUSD", platform="telegram")
-    out["social_sentiment"] = social_s
-    out["confidence_factors"]["news"] = news_s
-    out["confidence_factors"]["social"] = social_s
-
-    vol_data = _compute_volume(closes)
-    out["volume"] = vol_data["vol"]
-    out["vol_pct"] = vol_data["vol_pct"]
-    out["confidence_factors"]["volume"] = vol_data["vol_pct"]
-
-    price = float(stk["s"].iloc[i])
-    if out["up"] and out["lo"]:
-        pos = float((price - out["lo"]) / (out["up"] - out["lo"]) * 100.0)
-        pos = max(0.0, min(100.0, pos))
-        out["confidence_factors"]["price_pos"] = pos
-        out["confidence_factors"]["in_upper"] = pos >= 70
-        out["confidence_factors"]["in_lower"] = pos <= 30
-
-    ml_score = _ml_predict(closes, model=model, pair=pair)
-    out["ml_score"] = ml_score
-    out["confidence_factors"]["ml"] = ml_score
-
-    pa_score = _price_action_score(ohlc_data) if ohlc_data else 0.0
-    out["price_action"] = pa_score
-    out["confidence_factors"]["price_action"] = pa_score
-
-    tf_sig, tf_conf = _multi_tf_confluence(pair, period)
-    out["tf_confluence"] = tf_conf
-    out["confidence_factors"]["tf_confluence"] = tf_conf
-
-    adaptive = _adaptive_confidence(out)
-    out["adaptive_factor"] = adaptive
-    out["confidence_factors"]["adaptive"] = adaptive
-
-    best_mult, best_acc = _backtest_optimize(closes, model)
-    out["optimized_mult"] = best_mult
-    out["optimized_acc"] = best_acc
-    out["confidence_factors"]["backtest_mult"] = best_mult
-
-    conf_final = min(95.0, max(20.0, gate_score(out, model)))
-    out["confidence_factors"]["regime"] = out["regime"]
-    out["confidence"] = conf_final
+    out["confidence"] = out["full_acc"]
     vote = decide_at(stk, i, params) or "WAIT"
     out["signal"] = vote if out["tradeable"] else "NO TRADE"
-    out["accuracy"] = out["measured"]
     return out
 
 
@@ -787,41 +685,6 @@ def ml_train_async(pair, tf=None, force=False):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def _ml_predict(closes, model=None, pair=None):
-    """Real model probability score in [-1, 1]; learns on demand."""
-    try:
-        pair = str(pair or globals().get("sel_pair") or "EURUSD-OTC")
-        key = str(model or globals().get("CURRENT_MODEL") or "engine")
-        ck = f"{pair}#{key}"
-        with _ml_lock:
-            est = _ml_models.get(ck)
-            meta = dict(_ml_meta.get(ck) or {})
-        stale = time.time() - float(meta.get("trained_at", 0)) > ML_STALE_SEC
-        if est is None:
-            if closes:
-                ml_train(pair, closes, keys=[key], force=True)
-            with _ml_lock:
-                est = _ml_models.get(ck)
-            if est is None:
-                ml_train_async(pair)
-                return 0.0
-        elif stale:
-            ml_train_async(pair)
-        X, _ = _feat_matrix(closes)
-        if not X:
-            return 0.0
-        proba = est.predict_proba([X[-1]])[0]
-        classes = list(getattr(est, "classes_", [0, 1]))
-        if 1 not in classes:
-            return 0.0
-        p1 = float(proba[classes.index(1)])
-        p0 = float(proba[classes.index(0)]) if 0 in classes else 1.0 - p1
-        return max(-1.0, min(1.0, p1 - p0))
-    except Exception as e:
-        print("ml_predict failed:", e)
-        return 0.0
-
-
 def _ml_learn(pair, features, direction, win):
     """Feedback: a settled signal outcome becomes training data."""
     global _ml_learned_since
@@ -864,140 +727,10 @@ def model_perf(key, last=50):
         return None, 0
 
 
-def _multi_tf_confluence(pair, period_sec):
-    """Confirm signal across current, 2x, and 3x timeframes."""
-    try:
-        signals = []
-        for mult in (1, 2, 3):
-            closes, _ = get_series(pair, period_sec * mult, fetch=True)
-            if closes and len(closes) >= PERIOD + RSI_PERIOD + 6:
-                stk = _indicator_stack(closes)
-                i = len(stk["s"]) - 1
-                sig = decide_at(stk, i, MODEL_PARAMS.get(CURRENT_MODEL, MODEL_PARAMS["engine"]))
-                if sig:
-                    signals.append(sig)
-        if len(signals) >= 2:
-            calls = signals.count("CALL")
-            puts = signals.count("PUT")
-            if calls >= 2:
-                return "CALL", calls / len(signals)
-            if puts >= 2:
-                return "PUT", puts / len(signals)
-        return None, 0.0
-    except Exception:
-        return None, 0.0
-
-
-def _price_action_score(ohlc):
-    """Candlestick pattern recognition with weighted scores."""
-    if not ohlc or len(ohlc) < 5:
-        return 0.0
-    score = 0.0
-    last = ohlc[-1]
-    body = abs(last["c"] - last["o"])
-    rng = max(last["h"] - last["l"], 1e-12)
-    upper_wick = last["h"] - max(last["o"], last["c"])
-    lower_wick = min(last["o"], last["c"]) - last["l"]
-    if body / rng < 0.1:
-        score += 0.5
-    if lower_wick > 2 * body:
-        score += 1.5
-    if upper_wick > 2 * body:
-        score -= 1.5
-    if len(ohlc) >= 3:
-        trio = [1 if ohlc[-k]["c"] > ohlc[-k]["o"] else -1 for k in (1, 2, 3)]
-        if trio == [1, 1, 1]:
-            score -= 1.0
-        elif trio == [-1, -1, -1]:
-            score += 1.0
-    if len(ohlc) >= 2:
-        prev = ohlc[-2]
-        if prev["c"] < prev["o"] and last["c"] > last["o"] and last["c"] >= prev["o"]:
-            score += 2.0
-        if prev["c"] > prev["o"] and last["c"] < last["o"] and last["c"] <= prev["o"]:
-            score -= 2.0
-    return max(-5.0, min(5.0, score))
-
-
-def _adaptive_confidence(res):
-    """Adjust confidence based on win/loss streak."""
-    try:
-        st = track_load()["settled"][-10:]
-        if not st:
-            return 1.0
-        streak = 0
-        last_win = st[-1].get("win")
-        for s in reversed(st):
-            if s.get("win") == last_win:
-                streak += 1
-            else:
-                break
-        if last_win and streak >= 3:
-            return 1.15
-        if not last_win and streak >= 3:
-            return 0.85
-        return 1.0
-    except Exception:
-        return 1.0
-
-
-def _backtest_optimize(closes, model):
-    """Auto-tune parameters on recent data."""
-    try:
-        best_acc = 0.0
-        best_mult = STD_MULT
-        for mult in [1.5, 2.0, 2.5]:
-            wins = total = 0
-            s = pd.Series([float(x) for x in closes])
-            sma = s.rolling(PERIOD).mean()
-            std = s.rolling(PERIOD).std()
-            up = sma + mult * std
-            lo = sma - mult * std
-            for i in range(PERIOD + 10, len(s) - HORIZON):
-                if pd.isna(up.iloc[i]) or pd.isna(lo.iloc[i]):
-                    continue
-                c = s.iloc[i]
-                nxt = s.iloc[i + HORIZON]
-                sig = "PUT" if c > up.iloc[i] else ("CALL" if c < lo.iloc[i] else None)
-                if not sig:
-                    continue
-                total += 1
-                if (nxt > c) if sig == "CALL" else (nxt < c):
-                    wins += 1
-            acc = wins / total * 100 if total else 0
-            if acc > best_acc:
-                best_acc = acc
-                best_mult = mult
-        return best_mult, best_acc
-    except Exception:
-        return STD_MULT, 0.0
-
-
 def gate_score(res, model=None):
-    if res.get("measured") is not None:
-        base = float(res["measured"])
-    else:
-        params = MODEL_PARAMS.get(model or res.get("model") or CURRENT_MODEL,
-                                  MODEL_PARAMS["engine"])
-        base = params["normal_acc"]
-    news_s = res.get("news_sentiment", 0.0)
-    social_s = res.get("social_sentiment", 0.0)
-    volume_pct = res.get("vol_pct", 50.0)
-    ml_score = res.get("ml_score", 0.0)
-    pa_score = res.get("price_action", 0.0)
-    tf_confluence = res.get("tf_confluence", 0.0)
-    adaptive = res.get("adaptive_factor", 1.0)
-    news_adj = news_s * 10
-    social_adj = social_s * 5
-    ml_adj = ml_score * 8
-    pa_adj = pa_score * 3
-    tf_adj = tf_confluence * 5
-    volume_factor = 1.0 if volume_pct >= 50 else 0.95
-    regime = res.get("regime", "normal")
-    regime_factor = 1.1 if regime == "squeeze" else 1.0
-    adjusted = base + news_adj + social_adj + ml_adj + pa_adj + tf_adj
-    adjusted = adjusted * volume_factor * regime_factor * adaptive
-    return max(5.0, min(98.0, adjusted))
+    """Displayed confidence: the rule's measured (or validated) hit-rate (%) -
+    the same number the edge gate uses. No synthetic uplift."""
+    return max(0.0, min(100.0, float(res.get("full_acc", 0.0))))
 
 
 # ===== live signal tracking =====
@@ -1375,11 +1108,7 @@ def watch_text(rep, pair, period_sec):
         tag = "EDGE" if st.get("tradeable") else "signal"
         hist = (f"{edge:.0f}% edge vs {be:.0f}% break-even "
                 f"({st.get('horizon', HORIZON)}-bar target)")
-        news_note = ""
-        if st.get("news_sentiment") is not None:
-            ns = st["news_sentiment"]
-            news_note = f"\n\u26a1 News: {'Bullish' if ns > 0 else 'Bearish'} ({abs(ns):.2f})"
-        status = f"{dot} <b>{tag}: {word}</b> ({hist}){news_note}"
+        status = f"{dot} <b>{tag}: {word}</b> ({hist})"
     else:
         reason = st.get("gate_note") or st.get("note") or "not enough candle history yet"
         status = f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(reason, quote=False)}"
@@ -1682,8 +1411,7 @@ def sparkline(vals):
 def tech_metrics(closes, ohlc, res):
     out = {"vol": "Normal", "vol_pct": 50.0, "rsi_label": "Neutral", "macd": "Neutral",
            "ma": "Sideways", "sentiment": "Sideways pressure", "price": None,
-           "strength_label": "Moderate", "conditions": "Favorable",
-           "news_sentiment": 0.0, "social_sentiment": 0.0}
+           "conditions": "Favorable"}
     if not closes or len(closes) < 30:
         return out
     s = pd.Series([float(x) for x in closes])
@@ -1733,14 +1461,8 @@ def tech_metrics(closes, ohlc, res):
 
     out["price"] = float(s.iloc[i])
 
-    conf = gate_score(res)
-    out["strength_label"] = ("Strong" if conf >= 70 else
-                             "Moderate" if conf >= 60 else "Early")
-    out["n_signals"] = res.get("full_total", 0)
     out["conditions"] = ("Optimal" if (res.get("wide") and out["vol_pct"] >= 60) else
                          "Favorable" if out["vol_pct"] >= 30 else "Neutral")
-    out["news_sentiment"] = res.get("news_sentiment", 0.0)
-    out["social_sentiment"] = res.get("social_sentiment", 0.0)
     return out
 
 def card_caption(res, m, conf, pair, tf_txt):
@@ -1751,8 +1473,6 @@ def card_caption(res, m, conf, pair, tf_txt):
     dec = 3 if "JPY" in pair else 5
     def price(v):
         return f"{v:.{dec}f}" if v is not None else "n/a"
-    news_s = res.get("news_sentiment", 0.0)
-    social_s = res.get("social_sentiment", 0.0)
     regime = res.get("regime", "normal")
     mkey = str(globals().get("sel_model") or "engine")
     learn_parts = []
@@ -1784,12 +1504,12 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
         f"\u2022 MACD: <b>{m['macd']}</b>\n"
         f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
-        f"\U0001f4e6 Signal strength:\n"
-        f"\u2022 Strength: <b>{m['strength_label']} ({conf:.0f}%)</b> "
-        f"\u00b7 {m.get('n_signals', 0)} past signals checked\n"
+        f"\U0001f4e6 Signal edge:\n"
         f"\u2022 Edge: <b>{res.get('full_acc', 0):.0f}%</b> vs break-even "
         f"<b>{(res.get('break_even') or 0):.0f}%</b> "
-        f"(payout {(res.get('payout') or 0):.0f}%)\n"
+        f"(payout {(res.get('payout') or 0):.0f}%) "
+        f"\u00b7 {res.get('full_total', 0)} setups\n"
+        f"{_fold_line(res)}"
         f"{_validated_line(res)}"
         f"\u2022 Market conditions: <b>{m['conditions']}</b>\n"
         f"\u2022 Regime: <b>{regime}</b>\n\n"
@@ -1797,6 +1517,15 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"{win_line}"
         f"{now_hm()}"
     )
+
+def _fold_line(res):
+    """Per-fold hit-rate so edge stability is visible, or ''."""
+    ac = res.get("fold_accs") or []
+    if len(ac) < 2:
+        return ""
+    return ("\u2022 Folds: "
+            + " \u00b7 ".join(f"{a:.0f}%" for a in ac) + "\n")
+
 
 def _validated_line(res):
     """One-line summary of a validated backtest report, or ''."""

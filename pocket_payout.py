@@ -464,7 +464,13 @@ def account_trades(max_tries=5):
 
 def place_trade(asset, direction, amount, tf):
     """Place a CALL/PUT on the linked account. READ-WRITE - real money on live
-    accounts. Never raises. Returns (ok, message)."""
+    accounts. Never raises. Returns (ok, message).
+
+    Hard-disabled unless the ALLOW_TRADING env var is explicitly set to "1", so
+    a display-only bot can never place an order by accident."""
+    if os.getenv("ALLOW_TRADING") != "1":
+        return False, ("Trading is disabled. This is a display-only bot; set "
+                       "ALLOW_TRADING=1 only if you really intend to trade.")
     api = _ensure_client()
     if api is None:
         return False, "Account not linked (save SSID first)."

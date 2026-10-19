@@ -288,6 +288,8 @@ def main():
     ap.add_argument("--bars", type=int, default=800, help="candles to fetch")
     ap.add_argument("--payout", type=float, default=None, help="payout %% (default: live)")
     ap.add_argument("--horizon", type=int, default=bot.HORIZON, help="bars to expiry")
+    ap.add_argument("--folds", type=int, default=3,
+                    help="split bets into N chronological folds to test stability")
     ap.add_argument("--csv", default=None, help="use a CSV instead of live data")
     ap.add_argument("--save", default=None, help="write the report to a JSON file")
     args = ap.parse_args()
@@ -341,8 +343,26 @@ def _run_one(pair, df, ohlc, payout, args, results):
     s = summarize(bets, payout)
     report(pair, s, args.period)
     print(f"  ({n_sig} rule signals over {len(closes)} bars)")
+
+    # split the bets chronologically so edge stability is visible, and so the
+    # live bot can refuse an edge that only existed in an older regime
+    folds = []
+    nf = max(1, int(getattr(args, "folds", 3)))
+    if nf >= 2 and len(bets) >= nf * 20:
+        step = len(bets) // nf
+        for f in range(nf):
+            lo = f * step
+            hi = (f + 1) * step if f < nf - 1 else len(bets)
+            fs = summarize(bets[lo:hi], payout)
+            folds.append({k: fs[k] for k in
+                          ("bets", "wins", "win_rate", "wilson",
+                           "expectancy", "sqn", "break_even")})
+        print("  folds: " + "  ".join(
+            f"[{x['win_rate']:.0f}%/{x['bets']}b]" for x in folds))
+
     results[f"{pair}#{int(args.period)}"] = {"pair": pair,
-                                             "period": int(args.period), **s}
+                                             "period": int(args.period),
+                                             "folds": folds, **s}
 
 
 if __name__ == "__main__":
