@@ -283,6 +283,26 @@ class TestAcceptRegistry(unittest.TestCase):
         bot.PENDING_SIGNALS.clear()
 
 
+class TestThrottleRetry(unittest.TestCase):
+    def test_throttle_nonblocking_window(self):
+        import pocket_payout as pp
+        pp._RATE_LIMITS["__test__"] = (2, 60.0)
+        pp._HITS.pop("__test__", None)
+        self.assertTrue(pp._throttle("__test__", block=False))
+        self.assertTrue(pp._throttle("__test__", block=False))
+        self.assertFalse(pp._throttle("__test__", block=False))
+        pp._HITS.pop("__test__", None)
+        pp._RATE_LIMITS.pop("__test__", None)
+
+    def test_retry_returns_value_and_swallows(self):
+        import pocket_payout as pp
+        self.assertEqual(pp._retry(lambda: 42, tries=2, base=0), 42)
+
+        def boom():
+            raise RuntimeError("x")
+        self.assertIsNone(pp._retry(boom, tries=2, base=0))
+
+
 class TestSafety(unittest.TestCase):
     def test_place_trade_disabled_by_default(self):
         import pocket_payout

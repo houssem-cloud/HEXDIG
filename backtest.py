@@ -202,7 +202,7 @@ def summarize(bets, payout_pct, start_bank=100.0, stake=1.0):
            "wilson": 0.0, "break_even": bot.payout_break_even(payout_pct) or 0.0,
            "expectancy": 0.0, "profit_factor": 0.0, "max_drawdown_units": 0.0,
            "max_drawdown_pct": 0.0, "best_win_streak": 0, "worst_loss_streak": 0,
-           "sqn": 0.0, "net_units": 0.0, "payout": payout_pct}
+           "sqn": 0.0, "sortino": 0.0, "net_units": 0.0, "payout": payout_pct}
     if not n:
         return out
     rets = [b["ret"] for b in bets]
@@ -237,6 +237,11 @@ def summarize(bets, payout_pct, start_bank=100.0, stake=1.0):
     mean = sum(rets) / n
     sd = (sum((r - mean) ** 2 for r in rets) / n) ** 0.5
     sqn = (mean / sd * math.sqrt(n)) if sd > 0 else 0.0
+    # downside deviation -> Sortino (metric style borrowed from Hummingbot's
+    # backtesting results, which reports risk-adjusted return, not just win %)
+    downside = [r for r in rets if r < 0]
+    dsd = (sum(r * r for r in downside) / len(downside)) ** 0.5 if downside else 0.0
+    sortino = (mean / dsd * math.sqrt(n)) if dsd > 0 else 0.0
     bw, bl = _streaks(rets)
 
     out.update({
@@ -247,7 +252,8 @@ def summarize(bets, payout_pct, start_bank=100.0, stake=1.0):
         "max_drawdown_units": round(maxdd_u, 2),
         "max_drawdown_pct": round(maxdd_pct, 2),
         "best_win_streak": bw, "worst_loss_streak": bl,
-        "sqn": round(sqn, 2), "net_units": round(sum(rets), 2),
+        "sqn": round(sqn, 2), "sortino": round(sortino, 2),
+        "net_units": round(sum(rets), 2),
     })
     return out
 
@@ -276,7 +282,7 @@ def report(pair, s, period):
           f"net {s['net_units']:+.1f}u   -> {verdict_txt}")
     print(f"  max drawdown {s['max_drawdown_units']:.1f}u "
           f"({s['max_drawdown_pct']:.1f}%)   streaks W{s['best_win_streak']} "
-          f"L{s['worst_loss_streak']}   SQN {s['sqn']}")
+          f"L{s['worst_loss_streak']}   SQN {s['sqn']}   Sortino {s['sortino']}")
 
 
 # ============================================================ main

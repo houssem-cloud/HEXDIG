@@ -14,6 +14,7 @@ Setup (PC only, local PowerShell - NEVER paste SSID in Telegram):
 Engine: BinaryOptionsToolsV2 (unofficial, read-only). No trading.
 """
 
+import collections
 import json
 import os
 import sys
@@ -24,6 +25,50 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 SSID_FILE = os.path.join(os.path.dirname(__file__), "pocket_ssid.json")
+
+# ---- request throttling (idea ported from Hummingbot's AsyncThrottler) --------
+# Hummingbot guards every exchange call with a shared rate budget so a burst of
+# requests can't get the account rate-limited/banned. We do the same with a
+# small sliding-window limiter: generous enough to never slow normal use, but a
+# hard ceiling when the scanner fans out over every pair.
+_RATE_LIMITS = {                 # key -> (max calls, window seconds)
+    "candles": (40, 60.0),
+    "payout": (12, 60.0),
+}
+_HITS = {}
+_HITS_LOCK = threading.Lock()
+
+
+def _throttle(key, block=True):
+    """Reserve a slot for `key`. True if reserved; False only when non-blocking
+    and the window is full. Never raises."""
+    limit, window = _RATE_LIMITS.get(key, (60, 60.0))
+    while True:
+        with _HITS_LOCK:
+            now = time.time()
+            dq = _HITS.setdefault(key, collections.deque())
+            while dq and now - dq[0] > window:
+                dq.popleft()
+            if len(dq) < limit:
+                dq.append(now)
+                return True
+            wait = dq[0] + window - now
+        if not block:
+            return False
+        time.sleep(max(0.05, min(wait, 1.0)))
+
+
+def _retry(fn, tries=3, base=0.4):
+    """Call fn() up to `tries` times with exponential backoff (Hummingbot's
+    async_retry, synchronous). Returns the result or None. Never raises."""
+    for k in range(max(1, tries)):
+        try:
+            return fn()
+        except Exception:
+            if k == tries - 1:
+                return None
+            time.sleep(base * (2 ** k))
+    return None
 
 _LOCK = threading.Lock()
 _TTL = 120            # payout cache seconds
@@ -144,7 +189,8 @@ def refresh_payouts(force=False):
             return dict(_PAY["data"])
         out = {}
         try:
-            raw = api.payout()
+            _throttle("payout")
+            raw = _retry(api.payout)
             if isinstance(raw, dict):
                 for k, v in raw.items():
                     try:
@@ -177,6 +223,7 @@ def _fetch_candles(api, sym, period, count):
     (`get_candles_live`) once the library removes it. Never leaves a hang: the
     live path is only tried after the legacy call fails."""
     count = int(count)
+    _throttle("candles")
     legacy = getattr(api, "get_candles", None)
     if legacy is not None:
         try:
