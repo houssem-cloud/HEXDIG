@@ -1,0 +1,24 @@
+# ---- secrets (NEVER commit) ----
+pocket_ssid.json
+pocket_profile.json
+
+# ---- runtime state (regenerated while the bot runs) ----
+pocket_settings.json
+signal_track.json
+ml_data.json
+ml_models.pkl
+bot_settings.json
+_spike_img/
+
+# ---- python ----
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ---- editors / os ----
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
