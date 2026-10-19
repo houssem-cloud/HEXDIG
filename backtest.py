@@ -36,12 +36,22 @@ import json
 import math
 import time
 import argparse
+import collections
+import collections.abc
 
 import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# --- backtrader on modern Python (3.10+ / 3.15): restore symbols it expects ---
+for _name in ("Iterable", "Mapping", "MutableMapping", "Sequence",
+              "MutableSequence", "Callable", "Iterator", "Hashable"):
+    if not hasattr(collections, _name) and hasattr(collections.abc, _name):
+        setattr(collections, _name, getattr(collections.abc, _name))
+if not hasattr(time, "clock"):
+    time.clock = time.perf_counter
 
 # --- backtrader: prefer an installed copy, else the sibling folder ---
 try:
