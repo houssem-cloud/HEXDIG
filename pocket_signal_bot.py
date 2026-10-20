@@ -1491,7 +1491,12 @@ def market_pairs(market):
     pairs = get_pairs()
     if market == "otc":
         return [(p, pay) for p, pay in pairs if p.endswith("-OTC")]
+    if market == "all":
+        return list(pairs)
     return [(p, pay) for p, pay in pairs if not p.endswith("-OTC")]
+
+def market_label(market):
+    return {"otc": "OTC", "all": "BOTH (OTC + Stock)"}.get(market, "Stock")
 
 def tf_label(sec):
     for s, lab in TIMES:
@@ -1515,6 +1520,7 @@ def kb_menu():
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
              {"text": "OTC", "callback_data": "mkt:otc"}],
+            [{"text": "\U0001f310 Both (OTC + Stock)", "callback_data": "mkt:all"}],
             [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 def kb_pairs(page, pairs, per=8):
@@ -1738,7 +1744,14 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         pairs = market_pairs(market)
     except Exception:
         pairs = []
-    for pair, pay in pairs[:max_pairs]:
+    if market == "all":
+        otc = [x for x in pairs if x[0].endswith("-OTC")]
+        reg = [x for x in pairs if not x[0].endswith("-OTC")]
+        half = max(1, max_pairs // 2)
+        pairs = otc[:half] + reg[:half]
+    else:
+        pairs = pairs[:max_pairs]
+    for pair, pay in pairs:
         if pay and pay < MIN_PAYOUT:
             continue
         try:
@@ -1771,7 +1784,7 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
 
 def scan_text(results, period_sec, market):
     tf = tf_label(period_sec)
-    head = f"\U0001f50e <b>Scan {market.upper()}</b> \u00b7 {tf}\n"
+    head = f"\U0001f50e <b>Scan {market_label(market)}</b> \u00b7 {tf}\n"
     if not results:
         return head + "\nNo pairs with usable live data right now."
     lines = [head,
@@ -1846,7 +1859,7 @@ HELP_TEXT = (
     "/amount N - Set the stake for accepted signals\n"
     "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
-    "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
+    "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
     "Tap Find a trade to scan all pairs and get pinged only when one clears "
     "break-even.\n"
     "Accept signal places a real order ONLY if the bot was started with "
@@ -1863,7 +1876,7 @@ if __name__ == "__main__":
     print("Bot starting (SPIKE UI, live feed, on-demand signals)...")
     S = load_settings()
     sel_model = str(S.get("model") or "engine")
-    sel_market = str(S.get("market") or "otc")
+    sel_market = str(S.get("market") or "all")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
     auto_on = False
@@ -1908,7 +1921,7 @@ if __name__ == "__main__":
                   res.get("regime"), features=_feat_last(closes))
 
     def run_scan(chat):
-        mid = send(f"\U0001f50e Scanning {sel_market.upper()} pairs for a real edge\u2026",
+        mid = send(f"\U0001f50e Scanning {market_label(sel_market)} pairs for a real edge\u2026",
                    chat_id=chat, html_on=True)
 
         def worker():
@@ -2092,7 +2105,7 @@ if __name__ == "__main__":
         pairs = market_pairs(sel_market)
         text = f"{screen_head('Pair', 2)}\nSelect a currency pair:  <i>{now_hm()}</i>"
         if not pairs:
-            text = f"{screen_head('Pair', 2)}\nNo {sel_market.upper()} currency pairs are online right now. Try the other market."
+            text = f"{screen_head('Pair', 2)}\nNo {market_label(sel_market)} currency pairs are online right now. Try another market."
             keyboard = kb_market()
         else:
             pages = max(1, (len(pairs) + 7) // 8)
@@ -2262,7 +2275,7 @@ if __name__ == "__main__":
                 autoscan["chat"] = chat
                 autoscan["t"] = 0.0
                 if autoscan["on"]:
-                    send(f"\U0001f501 <b>Auto-scan ON</b> \u2014 {sel_market.upper()}, "
+                    send(f"\U0001f501 <b>Auto-scan ON</b> \u2014 {market_label(sel_market)}, "
                          f"{tf_label(sel_time)}. I'll check every "
                          f"{AUTOSCAN_GAP}s and message you only when a pair clears "
                          f"break-even.", chat_id=chat, html_on=True)
@@ -2321,7 +2334,7 @@ if __name__ == "__main__":
             mnt = rem // 60
             lines = ["\U0001f4e1 <b>Status</b>",
                      f"Uptime: {h}h {mnt}m",
-                     f"Market: {sel_market.upper()} \u00b7 {tf_label(sel_time)} "
+                     f"Market: {market_label(sel_market)} \u00b7 {tf_label(sel_time)} "
                      f"\u00b7 {html.escape(fmt_pair(sel_pair))}",
                      f"Auto-scan: {'ON' if autoscan['on'] else 'off'}",
                      f"Watch: {'ON' if watch['on'] else 'off'}",
