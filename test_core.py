@@ -6,6 +6,7 @@ Run:  python -m unittest discover -s tests
 import os
 import sys
 import json
+import time
 import tempfile
 import unittest
 
@@ -256,6 +257,49 @@ class TestScanner(unittest.TestCase):
         self.assertIn("AAA", txt)
         self.assertIn("pairs checked", txt)
 
+    def test_scan_all_balances_markets(self):
+        self._wire(set())
+        pairs = ([(f"O{i}-OTC", 95.0) for i in range(4)]
+                 + [(f"S{i}USD", 95.0) for i in range(4)])
+        bot.market_pairs = lambda market: pairs
+        got = [r["pair"] for r in bot.scan_pairs(60, "all", max_pairs=4)]
+        self.assertEqual(len(got), 4)
+        self.assertTrue(any(p.endswith("-OTC") for p in got))
+        self.assertTrue(any(not p.endswith("-OTC") for p in got))
+
+
+class TestMarketAll(unittest.TestCase):
+    def test_all_and_labels(self):
+        orig = bot.get_pairs
+        bot.get_pairs = lambda: [("EURUSD-OTC", 90.0), ("EURUSD", 84.0)]
+        try:
+            self.assertEqual(len(bot.market_pairs("all")), 2)
+            self.assertEqual(len(bot.market_pairs("otc")), 1)
+            self.assertEqual(len(bot.market_pairs("stock")), 1)
+        finally:
+            bot.get_pairs = orig
+        self.assertIn("BOTH", bot.market_label("all"))
+        self.assertEqual(bot.market_label("otc"), "OTC")
+        self.assertEqual(bot.market_label("stock"), "Stock")
+        self.assertEqual(bot.market_counts([{"pair": "EURUSD-OTC"},
+                                            {"pair": "GBPUSD"},
+                                            {"pair": "AUDCAD-OTC"}]), (2, 1))
+
+    def test_settings_keep_all_and_default_all(self):
+        tmp = tempfile.mkdtemp()
+        orig = bot.SETTINGS_FILE
+        bot.SETTINGS_FILE = os.path.join(tmp, "pocket_settings.json")
+        try:
+            self.assertEqual(bot.load_settings()["market"], "all")
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({"market": "all"}, f)
+            self.assertEqual(bot.load_settings()["market"], "all")
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({"market": "otc"}, f)
+            self.assertEqual(bot.load_settings()["market"], "otc")
+        finally:
+            bot.SETTINGS_FILE = orig
+
     def test_scan_text_empty(self):
         self.assertIn("No pairs", bot.scan_text([], 60, "otc"))
 
@@ -319,6 +363,79 @@ class TestThrottleRetry(unittest.TestCase):
         def boom():
             raise RuntimeError("x")
         self.assertIsNone(pp._retry(boom, tries=2, base=0))
+
+
+class TestResultNotify(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_results = bot.RESULTS_FILE
+        self._orig_pp = bot.pocket_payout
+        self._orig_send = bot.send
+        bot.RESULTS_FILE = os.path.join(self._tmp, "pending_results.json")
+        self.sent = []
+
+        def fake_send(text, chat_id=None, keyboard=None, html_on=False):
+            self.sent.append((chat_id, text))
+
+        class FakePP:
+            @staticmethod
+            def _norm(p):
+                return p.replace("/", "").upper()
+
+            @staticmethod
+            def account_balance():
+                return 1000.0
+
+        bot.send = fake_send
+        bot.pocket_payout = FakePP
+
+    def tearDown(self):
+        bot.RESULTS_FILE = self._orig_results
+        bot.pocket_payout = self._orig_pp
+        bot.send = self._orig_send
+
+    def _backdate(self, secs=120):
+        items = bot.results_load()
+        for p in items:
+            p["placed_ts"] = time.time() - secs
+        bot.results_save(items)
+
+    def test_ticket_match_notifies_once(self):
+        bot.note_placed(42, "abc123", "EURUSD-OTC", "CALL", 60)
+        self.assertEqual(len(bot.results_load()), 1)
+        self._backdate()
+        deal = {"id": "abc123", "asset": "EURUSD-OTC", "win": True,
+                "refund": False, "profit": 0.92, "open_ts": 1000,
+                "close_ts": int(time.time()), "tf": 60}
+        bot._notify_result(deal)
+        self.assertEqual(bot.results_load(), [])
+        self.assertEqual(len(self.sent), 1)
+        chat, text = self.sent[0]
+        self.assertEqual(chat, "42")
+        self.assertIn("WIN", text)
+        self.assertIn("+0.92", text)
+        self.assertIn("Balance", text)
+        bot._notify_result(deal)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_fallback_pair_time_and_refund(self):
+        bot.note_placed(7, "", "AUDCAD-OTC", "PUT", 60)
+        self._backdate()
+        placed = bot.results_load()[0]["placed_ts"]
+        deal = {"id": "unrelated", "asset": "AUDCAD-OTC", "win": False,
+                "refund": True, "profit": 0.0, "open_ts": placed + 3,
+                "close_ts": int(time.time()), "tf": 60}
+        bot._notify_result(deal)
+        self.assertEqual(bot.results_load(), [])
+        self.assertIn("REFUND", self.sent[0][1])
+
+    def test_unrelated_deal_ignored(self):
+        bot.note_placed(9, "t1", "GBPUSD-OTC", "CALL", 60)
+        bot._notify_result({"id": "t2", "asset": "USDJPY-OTC",
+                            "win": True, "refund": False, "profit": 0.9,
+                            "open_ts": 0, "tf": 60})
+        self.assertEqual(len(bot.results_load()), 1)
+        self.assertEqual(self.sent, [])
 
 
 class TestSafety(unittest.TestCase):

@@ -1782,13 +1782,21 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
     return out
 
 
+def market_counts(results):
+    otc = sum(1 for r in results if str(r.get("pair", "")).endswith("-OTC"))
+    return otc, len(results) - otc
+
+
 def scan_text(results, period_sec, market):
     tf = tf_label(period_sec)
     head = f"\U0001f50e <b>Scan {market_label(market)}</b> \u00b7 {tf}\n"
     if not results:
         return head + "\nNo pairs with usable live data right now."
-    lines = [head,
-             f"{len(results)} pairs checked \u2014 none clears break-even.", ""]
+    checked = f"{len(results)} pairs checked"
+    if market == "all":
+        o, s = market_counts(results)
+        checked += f" ({o} OTC / {s} stock)"
+    lines = [head, f"{checked} \u2014 none clears break-even.", ""]
     for r in results[:5]:
         be = r.get("break_even") or 0.0
         pay = r.get("payout") or 0.0
@@ -1901,7 +1909,7 @@ if __name__ == "__main__":
              "last_sig": None}
 
     STATUS = {"started": time.time(), "last_scan": 0.0, "scan_n": 0,
-              "best": None, "last_card": 0.0}
+              "scan_otc": 0, "scan_stock": 0, "best": None, "last_card": 0.0}
 
     AUTOSCAN_GAP = 180
     AUTOSCAN_COOLDOWN = 900
@@ -1933,6 +1941,7 @@ if __name__ == "__main__":
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
                 STATUS["last_scan"] = time.time()
                 STATUS["scan_n"] = len(results)
+                STATUS["scan_otc"], STATUS["scan_stock"] = market_counts(results)
                 STATUS["best"] = results[0] if results else None
                 best = next((r for r in results if r["tradeable"]), None)
                 if best:
@@ -2032,11 +2041,14 @@ if __name__ == "__main__":
                 results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
                 STATUS["last_scan"] = time.time()
                 STATUS["scan_n"] = len(results)
+                STATUS["scan_otc"], STATUS["scan_stock"] = market_counts(results)
                 STATUS["best"] = results[0] if results else None
                 if results:
                     top = results[0]
                     print(f"[autoscan] {market_label(sel_market)}: "
-                          f"{len(results)} pairs, best "
+                          f"{len(results)} pairs "
+                          f"({STATUS['scan_otc']} OTC / "
+                          f"{STATUS['scan_stock']} stock), best "
                           f"{top['pair']} {top['edge']:.0f}% vs "
                           f"{top['break_even'] or 0:.0f}% "
                           f"({'TRADEABLE' if top['tradeable'] else 'no edge'})")
@@ -2349,9 +2361,14 @@ if __name__ == "__main__":
             if STATUS["last_scan"]:
                 ago = int(time.time() - STATUS["last_scan"])
                 b = STATUS["best"]
+                split = ""
+                if sel_market == "all":
+                    split = (f" ({STATUS.get('scan_otc', 0)} OTC / "
+                             f"{STATUS.get('scan_stock', 0)} stock)")
                 if b:
                     lines.append(f"Last scan: {ago}s ago \u00b7 {STATUS['scan_n']} "
-                                 f"pairs \u00b7 best {html.escape(fmt_pair(b['pair']))} "
+                                 f"pairs{split} \u00b7 best "
+                                 f"{html.escape(fmt_pair(b['pair']))} "
                                  f"{b['edge']:.0f}% vs {(b['break_even'] or 0):.0f}%")
                     if b.get("note"):
                         lines.append(f"Why: {html.escape(b['note'])}")
