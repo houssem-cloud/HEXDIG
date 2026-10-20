@@ -783,6 +783,38 @@ def gate_score(res, model=None):
 # ===== live signal tracking =====
 TRACK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "signal_track.json")
+RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "pending_results.json")
+
+
+def results_load():
+    try:
+        with open(RESULTS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def results_save(items):
+    try:
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(items[-100:], f)
+    except Exception as e:
+        print("Results save failed:", e)
+
+
+def note_placed(chat, ticket, pair, direction, period, entry=None):
+    """Remember an accepted order so its settlement can be announced."""
+    cutoff = time.time() - 86400
+    items = [p for p in results_load()
+             if float(p.get("placed_ts") or 0) >= cutoff]
+    items.append({
+        "chat": str(chat), "ticket": str(ticket or ""),
+        "pair": pair, "dir": direction, "period": int(period),
+        "entry": entry, "placed_ts": time.time(),
+    })
+    results_save(items)
 
 def track_load():
     try:
@@ -990,6 +1022,64 @@ def account_perf(last=50):
         return 0, 0, None, 0
 
 
+def _notify_result(t):
+    """If a closed account deal matches an accepted (Accept-button) order,
+    announce its outcome in the chat that placed it."""
+    items = results_load()
+    if not items or pocket_payout is None:
+        return
+    tid = str(t.get("id") or "")
+    match = next((p for p in items
+                  if p.get("ticket") and str(p["ticket"]) == tid), None)
+    if match is None:
+        asset = t.get("asset") or ""
+        for p in items:
+            try:
+                if pocket_payout._norm(p.get("pair", "")) != asset:
+                    continue
+                period = int(p.get("period") or 60)
+                gap = abs(float(t.get("open_ts") or 0)
+                          - float(p.get("placed_ts") or 0))
+            except Exception:
+                continue
+            if gap <= period * 2 + 60:
+                match = p
+                break
+    if match is None:
+        return
+    try:
+        period = int(match.get("period") or 60)
+        placed = float(match.get("placed_ts") or 0)
+    except Exception:
+        period, placed = 60, 0.0
+    close_ts = int(t.get("close_ts") or 0)
+    # ignore a deal listed before the bet could have settled (still open)
+    if placed and (time.time() < placed + period - 2
+                   or (close_ts and close_ts < placed - 5)):
+        return
+    try:
+        items.remove(match)
+        results_save(items)
+    except ValueError:
+        pass
+    refund = bool(t.get("refund"))
+    win = bool(t.get("win"))
+    emoji = "\u21a9\ufe0f" if refund else ("\U0001f7e2" if win else "\U0001f534")
+    verdict = "REFUND (tie)" if refund else ("WIN" if win else "LOSS")
+    profit = float(t.get("profit") or 0.0)
+    bal = None
+    try:
+        bal = pocket_payout.account_balance()
+    except Exception:
+        pass
+    extra = f"\nBalance: {bal:.2f}" if bal is not None else ""
+    send(f"{emoji} <b>Trade settled \u2014 {verdict}</b>\n"
+         f"{match.get('dir')} {html.escape(fmt_pair(match.get('pair')))} \u00b7 "
+         f"{tf_label(match.get('period'))}\nProfit: {profit:+.2f}{extra}",
+         chat_id=match.get("chat"), html_on=True)
+    print(f"[result] {match.get('pair')} {verdict} profit={profit:+.2f}")
+
+
 def sync_account_trades():
     """Pull real closed trades from Pocket Option and learn from them."""
     if pocket_payout is None:
@@ -1023,6 +1113,10 @@ def sync_account_trades():
         if tid not in new_seen:
             continue
         changed = True
+        try:
+            _notify_result(t)
+        except Exception as e:
+            print("result notify failed:", e)
         if t.get("refund") or not t.get("entry"):
             continue
         went_up = t["exit"] > t["entry"]
@@ -1756,7 +1850,9 @@ HELP_TEXT = (
     "Tap Find a trade to scan all pairs and get pinged only when one clears "
     "break-even.\n"
     "Accept signal places a real order ONLY if the bot was started with "
-    "ALLOW_TRADING=1 (and your SSID is saved). Otherwise it is display-only."
+    "ALLOW_TRADING=1 (and your SSID is saved). Otherwise it is display-only.\n"
+    "Accepted orders send a WIN/LOSS/REFUND message with profit and balance "
+    "once the account deal settles."
 )
 
 if __name__ == "__main__":
@@ -1895,6 +1991,10 @@ if __name__ == "__main__":
         amount = TRADE_AMOUNT
         ok, msg = pocket_payout.place_trade(pair, signal, amount, period)
         if ok:
+            try:
+                note_placed(chat, msg, pair, signal, period)
+            except Exception as e:
+                print("note_placed failed:", e)
             bal = None
             try:
                 bal = pocket_payout.account_balance()
