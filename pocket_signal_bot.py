@@ -101,7 +101,7 @@ DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZ
 # ===== settings persistence =====
 def load_settings():
     d = {"last_pair": "EURUSD-OTC", "last_time": 60, "auto": False,
-         "model": "engine", "market": "otc"}
+         "model": "engine", "market": "all"}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:
@@ -110,8 +110,8 @@ def load_settings():
             pass
     if d.get("model") not in MODEL_PARAMS:
         d["model"] = "engine"
-    if d.get("market") not in ("stock", "otc"):
-        d["market"] = "otc"
+    if d.get("market") not in ("stock", "otc", "all"):
+        d["market"] = "all"
     return d
 
 def save_settings(s):
@@ -2035,7 +2035,8 @@ if __name__ == "__main__":
                 STATUS["best"] = results[0] if results else None
                 if results:
                     top = results[0]
-                    print(f"[autoscan] {len(results)} pairs, best "
+                    print(f"[autoscan] {market_label(sel_market)}: "
+                          f"{len(results)} pairs, best "
                           f"{top['pair']} {top['edge']:.0f}% vs "
                           f"{top['break_even'] or 0:.0f}% "
                           f"({'TRADEABLE' if top['tradeable'] else 'no edge'})")
@@ -2222,6 +2223,10 @@ if __name__ == "__main__":
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
                 persist()
+                if autoscan["on"]:
+                    send(f"\U0001f310 Market set to <b>{market_label(sel_market)}</b> "
+                         f"\u2014 auto-scan now covers it.", chat_id=chat,
+                         html_on=True)
                 mid = cb.get("message", {}).get("message_id")
                 send_pair_screen(chat, 0, edit_mid=mid)
             elif data.startswith("pg:"):
