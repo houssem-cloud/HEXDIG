@@ -958,6 +958,7 @@ def track_text():
 
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
 ACCT_SYNC_GAP = 45.0
+ACCT_SYNC_MAX_DEALS = 12   # bound work per sync so the loop never stalls
 
 
 def _acct_raw(asset, open_ts):
@@ -1100,6 +1101,8 @@ def sync_account_trades():
     changed = False
     new_ts = {}
     for t in trades:
+        if len(new_seen) >= ACCT_SYNC_MAX_DEALS:
+            break
         tid = str(t["id"])
         if tid in seen:
             continue
@@ -1881,6 +1884,19 @@ if __name__ == "__main__":
         print("TELEGRAM_TOKEN is not set. Set the env var to your BotFather token,")
         print('e.g. in PowerShell:  $env:TELEGRAM_TOKEN="<new token>"  then run again.')
         raise SystemExit(1)
+
+    import signal
+
+    def _clean_exit(signum, frame):
+        print("\nStopped.")
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _clean_exit)
+        signal.signal(signal.SIGTERM, _clean_exit)
+    except Exception:
+        pass
+
     print("Bot starting (SPIKE UI, live feed, on-demand signals)...")
     S = load_settings()
     sel_model = str(S.get("model") or "engine")
