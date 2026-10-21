@@ -1813,16 +1813,10 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         pairs = market_pairs(market)
     except Exception:
         pairs = []
-    if market == "all":
-        otc = [x for x in pairs if x[0].endswith("-OTC")]
-        reg = [x for x in pairs if not x[0].endswith("-OTC")]
-        half = max(1, max_pairs // 2)
-        pairs = otc[:half] + reg[:half]
-    else:
-        pairs = pairs[:max_pairs]
-    for pair, pay in pairs:
+
+    def _one(pair, pay):
         if pay and pay < MIN_PAYOUT:
-            continue
+            return None
         try:
             ohlc = fetch_ohlc(pair, period_sec)
             if ohlc and len(ohlc) >= PERIOD + RSI_PERIOD + 6:
@@ -1830,12 +1824,12 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
             else:
                 closes, note = get_series(pair, period_sec, fetch=True)
                 if note or not closes:
-                    continue
+                    return None
                 ohlc = None
             res = analyze(closes, pair=pair, period=period_sec, ohlc=ohlc)
             be = res.get("break_even")
             edge = res.get("full_acc", 0.0)
-            out.append({
+            return {
                 "pair": pair, "signal": res.get("signal"), "edge": edge,
                 "wilson": res.get("wilson", 0.0), "break_even": be,
                 "payout": res.get("payout"), "total": res.get("full_total", 0),
@@ -1846,9 +1840,37 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
                 "note": res.get("gate_note", ""),
                 "margin": (edge - be) if be else -99.0,
                 "res": res, "closes": closes,
-            })
+            }
         except Exception:
-            continue
+            return None
+
+    if market == "all":
+        otc = [x for x in pairs if x[0].endswith("-OTC")]
+        reg = [x for x in pairs if not x[0].endswith("-OTC")]
+        half = max(1, max_pairs // 2)
+        print(f"[scan] all: {len(otc)} OTC / {len(reg)} regular available")
+        for pair, pay in otc[:half] + reg[:half]:
+            r = _one(pair, pay)
+            if r:
+                out.append(r)
+        # one side is often closed: backfill its empty slots from the other
+        otc_ok = sum(1 for r in out if r["pair"].endswith("-OTC"))
+        spare = []
+        if len(out) - otc_ok < half:
+            spare += otc[half:]
+        if otc_ok < half:
+            spare += reg[half:]
+        for pair, pay in spare:
+            if len(out) >= max_pairs:
+                break
+            r = _one(pair, pay)
+            if r:
+                out.append(r)
+    else:
+        for pair, pay in pairs[:max_pairs]:
+            r = _one(pair, pay)
+            if r:
+                out.append(r)
     out.sort(key=lambda x: (x["tradeable"], x["margin"]), reverse=True)
 
     def _deepen(r):
@@ -1861,10 +1883,13 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         try:
             ohlc = fetch_ohlc(pair, per, SCAN_HISTORY, ttl=0)
             if not ohlc or len(ohlc) < PERIOD + RSI_PERIOD + 6:
+                print(f"[deep] {pair}: no extra history "
+                      f"(asked {SCAN_HISTORY} bars)")
                 return r
             closes = [x["c"] for x in ohlc]
             res = analyze(closes, pair=pair, period=per, ohlc=ohlc)
-        except Exception:
+        except Exception as e:
+            print(f"[deep] {pair}: failed ({e})")
             return r
         be = res.get("break_even")
         edge = res.get("full_acc", 0.0)
@@ -1880,6 +1905,9 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
             "margin": (edge - be) if be else -99.0,
             "res": res, "closes": closes, "history": len(closes),
         })
+        print(f"[deep] {pair}: {len(closes)} bars -> {edge:.0f}% vs "
+              f"{be or 0:.0f}% "
+              f"({'TRADEABLE' if r['tradeable'] else r['reason']})")
         return r
 
     for r in out[:max(1, SCAN_DEEP_N)]:
@@ -2550,10 +2578,13 @@ if __name__ == "__main__":
                     split = (f" ({STATUS.get('scan_otc', 0)} OTC / "
                              f"{STATUS.get('scan_stock', 0)} stock)")
                 if b:
+                    bars = (f" \u00b7 {b['history']} bars"
+                            if b.get("history") else "")
                     lines.append(f"Last scan: {ago}s ago \u00b7 {STATUS['scan_n']} "
                                  f"pairs{split} \u00b7 best "
                                  f"{html.escape(fmt_pair(b['pair']))} "
-                                 f"{b['edge']:.0f}% vs {(b['break_even'] or 0):.0f}%")
+                                 f"{b['edge']:.0f}% vs "
+                                 f"{(b['break_even'] or 0):.0f}%{bars}")
                     if b.get("note"):
                         lines.append(f"Why: {html.escape(b['note'])}")
                     if STATUS.get("blocked"):

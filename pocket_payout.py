@@ -230,19 +230,37 @@ def _fetch_candles(api, sym, period, count, block=True):
     if not _throttle("candles", block=block):
         return []
     legacy = getattr(api, "get_candles", None)
+    partial = []
     if legacy is not None:
         try:
-            return legacy(sym, int(period), count)
+            data = list(legacy(sym, int(period), count) or [])
+            # small requests are fine with the legacy window; large ones must
+            # prove they actually returned the extra history
+            if data and (len(data) >= count or count <= 260):
+                return data
+            partial = data
         except Exception:
             pass
-    hours = max(1.0, (int(period) * count) / 3600.0 * 1.25)
-    it = api.get_candles_live(sym, int(period), hours=hours, max_rows=count)
-    closed, _forming = next(it)
+    if not _throttle("candles", block=block):
+        return partial
     try:
-        it.stop()
-    except Exception:
-        pass
-    return list(closed or [])
+        hours = max(1.0, (int(period) * count) / 3600.0 * 1.25)
+        it = api.get_candles_live(sym, int(period), hours=hours, max_rows=count)
+        closed, _forming = next(it)
+        try:
+            it.stop()
+        except Exception:
+            pass
+        rows = list(closed or [])
+        if count >= 500:
+            print(f"[candles] {sym} {period}s: want {count}, "
+                  f"legacy {len(partial)}, live {len(rows)}")
+        return rows or partial
+    except Exception as e:
+        if count >= 500:
+            print(f"[candles] {sym} {period}s: want {count}, "
+                  f"legacy {len(partial)}, live failed ({e})")
+        return partial
 
 
 def get_closes(asset, period=60, offset=200, ttl=_CLOSES_TTL):
