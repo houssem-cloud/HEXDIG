@@ -54,7 +54,11 @@ SQUEEZE_PCT = 40
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
 MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
+EDGE_REPORT_MAX_AGE = 7 * 86400   # ignore validated reports older than 7 days
 TRADE_AMOUNT = 1.0     # stake for an accepted signal (only used with ALLOW_TRADING=1)
+SCAN_HISTORY = int(os.environ.get("SCAN_HISTORY", "900"))  # deep-check bars
+SCAN_DEEP_N = int(os.environ.get("SCAN_DEEP_N", "4"))      # candidates deep-checked
+SCAN_HISTORY = max(300, min(SCAN_HISTORY, 5000))
 
 # Signal + message-id -> context, so "Accept signal" can place the order the card
 # showed. Only the owner's chats reach here, and orders still need ALLOW_TRADING=1.
@@ -283,7 +287,7 @@ def _wilson_lower(wins, n, z=1.96):
 # ===== validated edge report (from backtest.py --save) =====
 EDGE_REPORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "edge_report.json")
-_EDGE_REPORT = {"mtime": None, "data": {}}
+_EDGE_REPORT = {"mtime": None, "generated": None, "data": {}}
 
 
 def load_edge_report():
@@ -296,23 +300,41 @@ def load_edge_report():
         return {}
     if _EDGE_REPORT["data"] and _EDGE_REPORT.get("mtime") == m:
         return _EDGE_REPORT["data"]
+    gen = None
     try:
         with open(EDGE_REPORT_FILE) as f:
             d = json.load(f)
         data = d.get("pairs", d) if isinstance(d, dict) else {}
+        if isinstance(d, dict):
+            gen = d.get("generated")
     except Exception:
         data = {}
+    try:
+        gen_ts = time.mktime(time.strptime(str(gen), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        gen_ts = m
     _EDGE_REPORT["mtime"] = m
+    _EDGE_REPORT["generated"] = gen_ts
     _EDGE_REPORT["data"] = data or {}
     return _EDGE_REPORT["data"]
 
 
 def edge_from_report(pair, period):
-    """Validated stats for this pair+timeframe, or None."""
+    """Validated stats for this pair+timeframe, or None. Stale reports are
+    ignored so an old backtest can never permanently veto live signals."""
     data = load_edge_report()
     if not data:
         return None
-    return data.get(f"{pair}#{int(period)}") or data.get(pair)
+    rep = data.get(f"{pair}#{int(period)}") or data.get(pair)
+    if not rep:
+        return None
+    gen = _EDGE_REPORT.get("generated")
+    if gen and time.time() - float(gen) > EDGE_REPORT_MAX_AGE:
+        return None
+    rep = dict(rep)
+    if gen:
+        rep["_age_days"] = round((time.time() - float(gen)) / 86400.0, 1)
+    return rep
 
 
 def _fold_edge(stk, params, folds=4):
@@ -376,7 +398,8 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
            "fold_stats": [],
            "confidence": 0.0, "tradeable": False, "payout": None,
            "break_even": None, "wilson": 0.0, "gate_note": "",
-           "validated": False, "validated_stats": None}
+           "gate_reason": "", "validated": False, "validated_stats": None,
+           "report_age": None}
     need = PERIOD + RSI_PERIOD + 6
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
@@ -410,61 +433,81 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
     out["break_even"] = be
     out["wilson"] = _wilson_lower(f_wins, f_total)
 
-    if be is None:
-        out["gate_note"] = "Payout unavailable - cannot judge the edge."
-    elif (out["payout"] or 0) < MIN_PAYOUT:
-        out["gate_note"] = (f"Payout {out['payout']:.0f}% is below the "
-                            f"{MIN_PAYOUT:.0f}% minimum.")
-    elif rep is not None:
-        # a validated backtest report exists - trust it over the live replay
-        out["validated"] = True
+    report_ok = False
+    report_note = ""
+    r_bets = r_exp = r_wr = r_wil = 0.0
+    if be is not None and (out["payout"] or 0) >= MIN_PAYOUT and rep is not None:
         out["validated_stats"] = rep
+        out["report_age"] = rep.get("_age_days")
         r_bets = int(rep.get("bets", 0))
         r_exp = float(rep.get("expectancy", 0.0))
         r_wr = float(rep.get("win_rate", 0.0))
         r_wil = float(rep.get("wilson", 0.0))
-        out["full_acc"] = r_wr
-        out["full_wins"] = int(rep.get("wins", 0))
-        out["full_total"] = r_bets
-        out["wilson"] = r_wil
         folds = rep.get("folds") or []
         last = folds[-1] if folds else None
         lw = float(last.get("wilson", 0.0)) if last else 0.0
         lexp = float(last.get("expectancy", 0.0)) if last else 0.0
         lbets = int(last.get("bets", 0)) if last else 0
+        age = (f" ({out['report_age']:.0f}d old)" if out["report_age"] else "")
         if r_bets < MIN_BACKTEST_N:
-            out["gate_note"] = (f"Validated on only {r_bets} bets - need "
-                                f"{MIN_BACKTEST_N}.")
+            report_note = (f"Validated{age} on only {r_bets} bets "
+                           f"(need {MIN_BACKTEST_N}).")
         elif r_exp <= 0:
-            out["gate_note"] = (f"Validated expectancy {r_exp:+.3f}/bet is not "
-                                f"positive.")
+            report_note = (f"Validated{age} expectancy {r_exp:+.3f}/bet "
+                           "is not positive.")
         elif r_wil < be:
-            out["gate_note"] = (f"Validated win {r_wr:.0f}% (Wilson {r_wil:.0f}%) "
-                                f"below break-even {be:.0f}%.")
+            report_note = (f"Validated{age} win {r_wr:.0f}% (Wilson "
+                           f"{r_wil:.0f}%) below break-even {be:.0f}%.")
         elif last and lbets >= 20 and (lexp <= 0 or lw < be):
-            out["gate_note"] = (f"Recent fold decayed: {last.get('win_rate', 0):.0f}% "
-                                f"win, {lexp:+.3f}/bet - edge not stable.")
+            report_note = "Recent validated fold decayed."
+        else:
+            report_ok = True
+
+    if be is None:
+        out["gate_reason"] = "payout"
+        out["gate_note"] = "Payout unavailable - cannot judge the edge."
+    elif (out["payout"] or 0) < MIN_PAYOUT:
+        out["gate_reason"] = "payout"
+        out["gate_note"] = (f"Payout {out['payout']:.0f}% is below the "
+                            f"{MIN_PAYOUT:.0f}% minimum.")
+    elif report_ok:
+        out["validated"] = True
+        out["tradeable"] = True
+        out["gate_reason"] = "ok"
+        out["full_acc"] = r_wr
+        out["full_wins"] = int(rep.get("wins", 0))
+        out["full_total"] = r_bets
+        out["wilson"] = r_wil
+        out["gate_note"] = (f"Validated {r_wr:.0f}% win, {r_exp:+.3f}/bet, "
+                            f"SQN {rep.get('sqn', 0)} over {r_bets} bets.")
+    else:
+        # the live replay is the decider; a negative or stale report can no
+        # longer veto a pair forever - it only adds a note when replay passes
+        if f_total < MIN_BACKTEST_N:
+            out["gate_reason"] = "sample"
+            out["gate_note"] = (f"Only {f_total} resolved setups - need "
+                                f"{MIN_BACKTEST_N} to trust the edge.")
+        elif out["full_acc"] < be + EDGE_MARGIN:
+            out["gate_reason"] = "edge"
+            out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above "
+                                f"break-even {be:.0f}% (need +{EDGE_MARGIN:.0f}).")
+        elif out["wilson"] < be:
+            out["gate_reason"] = "wilson"
+            out["gate_note"] = (f"Edge {out['full_acc']:.0f}% looks fine but its "
+                                f"95% floor ({out['wilson']:.0f}%) is below "
+                                f"break-even {be:.0f}% - too thin to trust.")
+        elif out["fold_accs"] and out["fold_accs"][-1] < be:
+            out["gate_reason"] = "fold"
+            out["gate_note"] = (f"Most recent fold {out['fold_accs'][-1]:.0f}% "
+                                f"is below break-even {be:.0f}% - edge not stable.")
         else:
             out["tradeable"] = True
-            out["gate_note"] = (f"Validated {r_wr:.0f}% win, {r_exp:+.3f}/bet, "
-                                f"SQN {rep.get('sqn', 0)} over {r_bets} bets.")
-    elif f_total < MIN_BACKTEST_N:
-        out["gate_note"] = (f"Only {f_total} resolved setups - need "
-                            f"{MIN_BACKTEST_N} to trust the edge.")
-    elif out["full_acc"] < be + EDGE_MARGIN:
-        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above break-even "
-                            f"{be:.0f}% (need +{EDGE_MARGIN:.0f}).")
-    elif out["wilson"] < be:
-        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% looks fine but its "
-                            f"95% floor ({out['wilson']:.0f}%) is below break-even "
-                            f"{be:.0f}% - too thin to trust.")
-    elif out["fold_accs"] and out["fold_accs"][-1] < be:
-        out["gate_note"] = (f"Most recent fold {out['fold_accs'][-1]:.0f}% is below "
-                            f"break-even {be:.0f}% - edge not stable.")
-    else:
-        out["tradeable"] = True
-        out["gate_note"] = (f"Edge {out['full_acc']:.0f}% (floor {out['wilson']:.0f}%) "
-                            f"clears break-even {be:.0f}% over {f_total} setups.")
+            out["gate_reason"] = "ok"
+            out["gate_note"] = (f"Edge {out['full_acc']:.0f}% (floor "
+                                f"{out['wilson']:.0f}%) clears break-even "
+                                f"{be:.0f}% over {f_total} setups.")
+            if report_note:
+                out["gate_note"] += f" ({report_note} Live replay passes now.)"
 
     i = len(s) - 1
     out["rsi"] = float(stk["rsi"].iloc[i]) if not pd.isna(stk["rsi"].iloc[i]) else None
@@ -1298,15 +1341,16 @@ def demo_series(key, period_sec, n=220):
     vol = base * 0.0008 * np.sqrt(period_sec / 60.0)
     return list(np.cumsum(np.random.normal(0, vol, n)) + base)
 
-def get_series(pair, period_sec, fetch=True):
+def get_series(pair, period_sec, fetch=True, count=220):
     global DATA_SRC
     if pocket_payout is not None:
         try:
-            closes = pocket_payout.live_closes(pair, period_sec) if fetch else None
+            closes = (pocket_payout.live_closes(pair, period_sec)
+                      if fetch and count <= 220 else None)
             if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
                 DATA_SRC = "live stream"
                 return closes, ""
-            closes = (pocket_payout.get_closes(pair, period_sec, 220) if fetch
+            closes = (pocket_payout.get_closes(pair, period_sec, count) if fetch
                       else pocket_payout.peek_closes(pair, period_sec))
             if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
                 DATA_SRC = "SSID snapshot"
@@ -1338,13 +1382,15 @@ def warm_feed(pair, period_sec, wait=10.0):
                      args=(pair, int(period_sec)),
                      kwargs={"wait": wait}, daemon=True).start()
 
-def fetch_ohlc(pair, period_sec):
+def fetch_ohlc(pair, period_sec, count=220, ttl=None):
     if pocket_payout is None:
         return None
     try:
-        ohlc = pocket_payout.live_ohlcv(pair, period_sec)
+        ohlc = (pocket_payout.live_ohlcv(pair, period_sec)
+                if count <= 220 else None)
         if not ohlc:
-            ohlc = pocket_payout.get_ohlcv(pair, period_sec, 220)
+            extra = {} if ttl is None else {"ttl": ttl}
+            ohlc = pocket_payout.get_ohlcv(pair, period_sec, count, **extra)
         return ohlc
     except Exception:
         return None
@@ -1795,6 +1841,8 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
                 "payout": res.get("payout"), "total": res.get("full_total", 0),
                 "tradeable": bool(res.get("tradeable")),
                 "validated": bool(res.get("validated")),
+                "reason": res.get("gate_reason", ""),
+                "report_age": res.get("report_age"),
                 "note": res.get("gate_note", ""),
                 "margin": (edge - be) if be else -99.0,
                 "res": res, "closes": closes,
@@ -1802,12 +1850,68 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         except Exception:
             continue
     out.sort(key=lambda x: (x["tradeable"], x["margin"]), reverse=True)
+
+    def _deepen(r):
+        """Re-score a top candidate on far more history (default 900 bars).
+
+        A 220-bar replay gives a very wide Wilson interval, so a genuine 55%
+        edge can never clear break-even. More bars make the floor honest
+        without loosening it."""
+        pair, per = r["pair"], period_sec
+        try:
+            ohlc = fetch_ohlc(pair, per, SCAN_HISTORY, ttl=0)
+            if not ohlc or len(ohlc) < PERIOD + RSI_PERIOD + 6:
+                return r
+            closes = [x["c"] for x in ohlc]
+            res = analyze(closes, pair=pair, period=per, ohlc=ohlc)
+        except Exception:
+            return r
+        be = res.get("break_even")
+        edge = res.get("full_acc", 0.0)
+        r.update({
+            "signal": res.get("signal"), "edge": edge,
+            "wilson": res.get("wilson", 0.0), "break_even": be,
+            "payout": res.get("payout"), "total": res.get("full_total", 0),
+            "tradeable": bool(res.get("tradeable")),
+            "validated": bool(res.get("validated")),
+            "reason": res.get("gate_reason", ""),
+            "report_age": res.get("report_age"),
+            "note": res.get("gate_note", ""),
+            "margin": (edge - be) if be else -99.0,
+            "res": res, "closes": closes, "history": len(closes),
+        })
+        return r
+
+    for r in out[:max(1, SCAN_DEEP_N)]:
+        _deepen(r)
+    out.sort(key=lambda x: (x["tradeable"], x["margin"]), reverse=True)
     return out
+
+
+REASON_LABELS = {"report": "negative report", "sample": "too few setups",
+                 "edge": "edge too small", "wilson": "thin floor",
+                 "fold": "recent fold weak", "payout": "payout/sample"}
 
 
 def market_counts(results):
     otc = sum(1 for r in results if str(r.get("pair", "")).endswith("-OTC"))
     return otc, len(results) - otc
+
+
+def reason_counts(results):
+    c = {}
+    for r in results:
+        if r.get("tradeable"):
+            continue
+        k = r.get("reason") or "other"
+        c[k] = c.get(k, 0) + 1
+    return c
+
+
+def reason_text(results):
+    c = reason_counts(results)
+    return ", ".join(f"{REASON_LABELS.get(k, k)} {v}"
+                     for k, v in sorted(c.items(), key=lambda x: -x[1]))
 
 
 def scan_text(results, period_sec, market):
@@ -1820,6 +1924,10 @@ def scan_text(results, period_sec, market):
         o, s = market_counts(results)
         checked += f" ({o} OTC / {s} stock)"
     lines = [head, f"{checked} \u2014 none clears break-even.", ""]
+    blk = reason_text(results)
+    if blk:
+        lines.append(f"\U0001f6ab Blocked by: {blk}")
+        lines.append("")
     for r in results[:5]:
         be = r.get("break_even") or 0.0
         pay = r.get("payout") or 0.0
@@ -1956,7 +2064,8 @@ if __name__ == "__main__":
              "last_sig": None}
 
     STATUS = {"started": time.time(), "last_scan": 0.0, "scan_n": 0,
-              "scan_otc": 0, "scan_stock": 0, "best": None, "last_card": 0.0}
+              "scan_otc": 0, "scan_stock": 0, "best": None, "last_card": 0.0,
+              "blocked": ""}
 
     AUTOSCAN_GAP = 180
     AUTOSCAN_COOLDOWN = 900
@@ -1989,6 +2098,7 @@ if __name__ == "__main__":
                 STATUS["last_scan"] = time.time()
                 STATUS["scan_n"] = len(results)
                 STATUS["scan_otc"], STATUS["scan_stock"] = market_counts(results)
+                STATUS["blocked"] = reason_text(results)
                 STATUS["best"] = results[0] if results else None
                 best = next((r for r in results if r["tradeable"]), None)
                 if best:
@@ -2089,16 +2199,22 @@ if __name__ == "__main__":
                 STATUS["last_scan"] = time.time()
                 STATUS["scan_n"] = len(results)
                 STATUS["scan_otc"], STATUS["scan_stock"] = market_counts(results)
+                STATUS["blocked"] = reason_text(results)
                 STATUS["best"] = results[0] if results else None
                 if results:
                     top = results[0]
+                    blocked = ("" if top["tradeable"]
+                               else f" \u00b7 blocked: {STATUS['blocked']}")
+                    hist = (f" [deep {top['history']} bars]"
+                            if top.get("history") else "")
                     print(f"[autoscan] {market_label(sel_market)}: "
                           f"{len(results)} pairs "
                           f"({STATUS['scan_otc']} OTC / "
                           f"{STATUS['scan_stock']} stock), best "
                           f"{top['pair']} {top['edge']:.0f}% vs "
-                          f"{top['break_even'] or 0:.0f}% "
-                          f"({'TRADEABLE' if top['tradeable'] else 'no edge'})")
+                          f"{top['break_even'] or 0:.0f}%{hist} "
+                          f"({'TRADEABLE' if top['tradeable'] else 'no edge'})"
+                          f"{blocked}")
                 else:
                     print("[autoscan] no usable pairs")
                 now = time.time()
@@ -2440,6 +2556,8 @@ if __name__ == "__main__":
                                  f"{b['edge']:.0f}% vs {(b['break_even'] or 0):.0f}%")
                     if b.get("note"):
                         lines.append(f"Why: {html.escape(b['note'])}")
+                    if STATUS.get("blocked"):
+                        lines.append(f"Blocked: {html.escape(STATUS['blocked'])}")
                 else:
                     lines.append(f"Last scan: {ago}s ago \u00b7 no usable pairs "
                                  "(check payout/SSID)")
