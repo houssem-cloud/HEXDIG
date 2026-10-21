@@ -13,13 +13,14 @@ compared to the payout break-even. A BUY/SELL card is shown ONLY when that edge
 clears break-even; otherwise the bot says NO TRADE.
 
 Display-only by default. The card's "Accept signal" button can place a real
-order, but ONLY when the bot is started with ALLOW_TRADING=1 and an SSID is
-saved (see pocket_payout.py); otherwise it just prints a disabled notice.
+order only after `/trading on` (persisted in pocket_settings.json) and with an
+SSID saved (see pocket_payout.py); otherwise it prints a disabled notice. The
+ALLOW_TRADING=1 env var is still honoured for one-off launches.
 
 Run: pip install pandas numpy requests
      set TELEGRAM_TOKEN (BotFather token) and TELEGRAM_CHAT_ID env vars
      python pocket_signal_bot.py
-     (add ALLOW_TRADING=1 to enable the Accept-order button)
+     (/trading on to enable the Accept-order button, or export ALLOW_TRADING=1)
 """
 
 import time
@@ -112,7 +113,15 @@ def load_settings():
         d["model"] = "engine"
     if d.get("market") not in ("stock", "otc", "all"):
         d["market"] = "all"
+    if "allow_trading" not in d:
+        d["allow_trading"] = os.getenv("ALLOW_TRADING") == "1"
+    else:
+        d["allow_trading"] = bool(d["allow_trading"])
     return d
+
+
+def trading_on():
+    return os.getenv("ALLOW_TRADING") == "1"
 
 def save_settings(s):
     try:
@@ -1879,13 +1888,14 @@ HELP_TEXT = (
     "/scan - Scan every pair for a real edge now\n"
     "/auto - Toggle continuous auto-scan alerts\n"
     "/amount N - Set the stake for accepted signals\n"
+    "/trading on|off - Enable/disable real orders (persists across restarts)\n"
     "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
     "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
     "Tap Find a trade to scan all pairs and get pinged only when one clears "
     "break-even.\n"
-    "Accept signal places a real order ONLY if the bot was started with "
-    "ALLOW_TRADING=1 (and your SSID is saved). Otherwise it is display-only.\n"
+    "Accept signal places a real order only when trading is enabled with "
+    "/trading on (and your SSID is saved). Otherwise it is display-only.\n"
     "Accepted orders send a WIN/LOSS/REFUND message with profit and balance "
     "once the account deal settles."
 )
@@ -1917,6 +1927,12 @@ if __name__ == "__main__":
     auto_on = False
     CURRENT_MODEL = sel_model
     print(f"Market: {market_label(sel_market)} | {tf_label(sel_time)} | {sel_pair}")
+    if S.get("allow_trading"):
+        os.environ["ALLOW_TRADING"] = "1"
+    else:
+        os.environ.pop("ALLOW_TRADING", None)
+    print("Trading: " + ("ENABLED (Accept places real orders)"
+                         if trading_on() else "display-only"))
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
@@ -2035,9 +2051,9 @@ if __name__ == "__main__":
             send("Live trading is unavailable on this host (library not loaded).",
                  chat_id=chat)
             return
-        if os.getenv("ALLOW_TRADING") != "1":
-            send("\U0001f512 <b>Accept is disabled.</b> Restart the bot with "
-                 "ALLOW_TRADING=1 to allow real orders.\n\nSignal: "
+        if not trading_on():
+            send("\U0001f512 <b>Accept is disabled.</b> Send "
+                 "/trading on to allow real orders.\n\nSignal: "
                  f"{signal} {html.escape(fmt_pair(pair))} \u00b7 "
                  f"{tf_label(period)}", chat_id=chat, html_on=True)
             return
@@ -2130,7 +2146,8 @@ if __name__ == "__main__":
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
                        "model": sel_model, "market": sel_market,
                        "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
-                       "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT})
+                       "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT,
+                       "allow_trading": trading_on()})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nSignal engine for Pocket Option.\n"
@@ -2370,6 +2387,26 @@ if __name__ == "__main__":
                     send("Usage: /amount 1", chat_id=chat)
             else:
                 send(f"Stake is {TRADE_AMOUNT:g}. Usage: /amount 1", chat_id=chat)
+        elif cmd in ("/trading", "trading"):
+            parts = raw.split()
+            arg = parts[1].lower() if len(parts) >= 2 else ""
+            if arg in ("on", "1", "yes", "enable", "enabled"):
+                os.environ["ALLOW_TRADING"] = "1"
+                persist()
+                send("\U0001f513 <b>Trading ENABLED</b> \u2014 Accept now places "
+                     "real orders on the linked account (demo or live), stake "
+                     f"{TRADE_AMOUNT:g}. It stays on across restarts. Send "
+                     "/trading off to disable.", chat_id=chat, html_on=True)
+            elif arg in ("off", "0", "no", "disable", "disabled"):
+                os.environ.pop("ALLOW_TRADING", None)
+                persist()
+                send("\U0001f512 <b>Trading disabled</b> \u2014 the bot is "
+                     "display-only again.", chat_id=chat, html_on=True)
+            else:
+                send(f"Trading is "
+                     f"{'ENABLED' if trading_on() else 'disabled'}. "
+                     "Usage: /trading on | /trading off", chat_id=chat,
+                     html_on=True)
         elif cmd in ("/auto", "auto"):
             autoscan["on"] = not autoscan["on"]
             autoscan["chat"] = chat
@@ -2387,7 +2424,7 @@ if __name__ == "__main__":
                      f"Auto-scan: {'ON' if autoscan['on'] else 'off'}",
                      f"Watch: {'ON' if watch['on'] else 'off'}",
                      "Trading: " + ("ENABLED (real orders)"
-                                    if os.getenv("ALLOW_TRADING") == "1"
+                                    if trading_on()
                                     else "display-only (Accept is disabled)")]
             if STATUS["last_scan"]:
                 ago = int(time.time() - STATUS["last_scan"])
