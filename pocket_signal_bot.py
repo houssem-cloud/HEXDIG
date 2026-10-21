@@ -54,6 +54,10 @@ SQUEEZE_PCT = 40
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
 MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
+WILSON_Z = float(os.environ.get("WILSON_Z", "1.96"))  # 1.96=95%, 1.28=80%
+GATE_MODE = os.environ.get("GATE_MODE", "strict").strip().lower()
+if GATE_MODE not in ("strict", "point"):
+    GATE_MODE = "strict"
 EDGE_REPORT_MAX_AGE = 7 * 86400   # ignore validated reports older than 7 days
 TRADE_AMOUNT = 1.0     # stake for an accepted signal (only used with ALLOW_TRADING=1)
 SCAN_HISTORY = int(os.environ.get("SCAN_HISTORY", "900"))  # deep-check bars
@@ -431,7 +435,7 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
         if out["payout"] is None and rep.get("payout"):
             out["payout"] = rep.get("payout")
     out["break_even"] = be
-    out["wilson"] = _wilson_lower(f_wins, f_total)
+    out["wilson"] = _wilson_lower(f_wins, f_total, WILSON_Z)
 
     report_ok = False
     report_note = ""
@@ -491,11 +495,11 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
             out["gate_reason"] = "edge"
             out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above "
                                 f"break-even {be:.0f}% (need +{EDGE_MARGIN:.0f}).")
-        elif out["wilson"] < be:
+        elif GATE_MODE != "point" and out["wilson"] < be:
             out["gate_reason"] = "wilson"
             out["gate_note"] = (f"Edge {out['full_acc']:.0f}% looks fine but its "
-                                f"95% floor ({out['wilson']:.0f}%) is below "
-                                f"break-even {be:.0f}% - too thin to trust.")
+                                f"statistical floor ({out['wilson']:.0f}%) is "
+                                f"below break-even {be:.0f}% - too thin.")
         elif out["fold_accs"] and out["fold_accs"][-1] < be:
             out["gate_reason"] = "fold"
             out["gate_note"] = (f"Most recent fold {out['fold_accs'][-1]:.0f}% "
@@ -503,9 +507,14 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
         else:
             out["tradeable"] = True
             out["gate_reason"] = "ok"
-            out["gate_note"] = (f"Edge {out['full_acc']:.0f}% (floor "
-                                f"{out['wilson']:.0f}%) clears break-even "
-                                f"{be:.0f}% over {f_total} setups.")
+            if GATE_MODE == "point":
+                out["gate_note"] = (f"Edge {out['full_acc']:.0f}% clears "
+                                    f"break-even {be:.0f}% +{EDGE_MARGIN:.0f} "
+                                    f"over {f_total} setups [point mode].")
+            else:
+                out["gate_note"] = (f"Edge {out['full_acc']:.0f}% (floor "
+                                    f"{out['wilson']:.0f}%) clears break-even "
+                                    f"{be:.0f}% over {f_total} setups.")
             if report_note:
                 out["gate_note"] += f" ({report_note} Live replay passes now.)"
 
@@ -1809,6 +1818,7 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
     comes first, then by how far its measured edge sits above break-even. Pairs
     whose payout is already below MIN_PAYOUT are skipped before any fetch."""
     out = []
+    DEEP_INFO.clear()
     try:
         pairs = market_pairs(market)
     except Exception:
@@ -1880,15 +1890,37 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         edge can never clear break-even. More bars make the floor honest
         without loosening it."""
         pair, per = r["pair"], period_sec
+        broad_n = len(r.get("closes") or [])
+        diag = {}
+
+        def mark(got, kept):
+            DEEP_INFO[pair] = {"got": got, "want": SCAN_HISTORY,
+                               "kept": kept,
+                               "legacy": diag.get("legacy"),
+                               "live": diag.get("live"),
+                               "batches": diag.get("batches")}
+
         try:
             ohlc = fetch_ohlc(pair, per, SCAN_HISTORY, ttl=0)
-            if not ohlc or len(ohlc) < PERIOD + RSI_PERIOD + 6:
+            try:
+                diag = dict(getattr(pocket_payout, "LAST_FETCH", {}) or {})
+            except Exception:
+                diag = {}
+            closes = [x["c"] for x in ohlc] if ohlc else []
+            if not closes or len(closes) < PERIOD + RSI_PERIOD + 6:
+                mark(len(closes), broad_n)
                 print(f"[deep] {pair}: no extra history "
                       f"(asked {SCAN_HISTORY} bars)")
                 return r
-            closes = [x["c"] for x in ohlc]
+            if len(closes) <= broad_n:
+                # never let a shorter fetch weaken the estimate
+                mark(len(closes), broad_n)
+                print(f"[deep] {pair}: got {len(closes)} <= broad {broad_n} "
+                      "bars, keeping broad")
+                return r
             res = analyze(closes, pair=pair, period=per, ohlc=ohlc)
         except Exception as e:
+            mark(0, broad_n)
             print(f"[deep] {pair}: failed ({e})")
             return r
         be = res.get("break_even")
@@ -1905,6 +1937,7 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
             "margin": (edge - be) if be else -99.0,
             "res": res, "closes": closes, "history": len(closes),
         })
+        mark(len(closes), len(closes))
         print(f"[deep] {pair}: {len(closes)} bars -> {edge:.0f}% vs "
               f"{be or 0:.0f}% "
               f"({'TRADEABLE' if r['tradeable'] else r['reason']})")
@@ -1919,6 +1952,8 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
 REASON_LABELS = {"report": "negative report", "sample": "too few setups",
                  "edge": "edge too small", "wilson": "thin floor",
                  "fold": "recent fold weak", "payout": "payout/sample"}
+
+DEEP_INFO = {}   # pair -> diagnostics for the last deep re-check
 
 
 def market_counts(results):
@@ -2567,9 +2602,12 @@ if __name__ == "__main__":
                      f"\u00b7 {html.escape(fmt_pair(sel_pair))}",
                      f"Auto-scan: {'ON' if autoscan['on'] else 'off'}",
                      f"Watch: {'ON' if watch['on'] else 'off'}",
-                     "Trading: " + ("ENABLED (real orders)"
-                                    if trading_on()
-                                    else "display-only (Accept is disabled)")]
+                      "Trading: " + ("ENABLED (real orders)"
+                                     if trading_on()
+                                     else "display-only (Accept is disabled)"),
+                      "Gate: " + ("strict (Wilson floor)"
+                                  if GATE_MODE == "strict"
+                                  else "point (+margin, no floor)")]
             if STATUS["last_scan"]:
                 ago = int(time.time() - STATUS["last_scan"])
                 b = STATUS["best"]
@@ -2589,6 +2627,14 @@ if __name__ == "__main__":
                         lines.append(f"Why: {html.escape(b['note'])}")
                     if STATUS.get("blocked"):
                         lines.append(f"Blocked: {html.escape(STATUS['blocked'])}")
+                    di = DEEP_INFO.get(b["pair"])
+                    if di:
+                        src = (f" (legacy {di.get('legacy')} / "
+                               f"live {di.get('live')} / "
+                               f"{di.get('batches')} batches)")
+                        lines.append(
+                            f"Deep: got {di['got']}/{di['want']} bars"
+                            f"{src} \u00b7 kept {di['kept']}")
                 else:
                     lines.append(f"Last scan: {ago}s ago \u00b7 no usable pairs "
                                  "(check payout/SSID)")

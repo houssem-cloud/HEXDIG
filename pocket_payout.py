@@ -77,6 +77,7 @@ _PAY = {"t": 0, "data": {}}
 _CLOSES = {}          # norm asset -> (time, [closes])
 _OHLC = {}            # norm asset -> (time, [{o,h,l,c}, ...])
 _CLIENT = {"api": None, "ssid": "", "map": {}}
+LAST_FETCH = {}       # diagnostics: last large candle request
 
 
 def load_ssid():
@@ -237,6 +238,12 @@ def _fetch_candles(api, sym, period, count, block=True):
             # small requests are fine with the legacy window; large ones must
             # prove they actually returned the extra history
             if data and (len(data) >= count or count <= 260):
+                if count >= 500:
+                    LAST_FETCH.update({"sym": sym, "period": int(period),
+                                       "want": count, "legacy": len(data),
+                                       "live": 0})
+                    print(f"[candles] {sym} {period}s: want {count}, "
+                          f"legacy {len(data)} (ok)")
                 return data
             partial = data
         except Exception:
@@ -246,18 +253,53 @@ def _fetch_candles(api, sym, period, count, block=True):
     try:
         hours = max(1.0, (int(period) * count) / 3600.0 * 1.25)
         it = api.get_candles_live(sym, int(period), hours=hours, max_rows=count)
-        closed, _forming = next(it)
+        if count < 500:
+            closed, _forming = next(it)
+            try:
+                it.stop()
+            except Exception:
+                pass
+            return list(closed or []) or partial
+        # large request: the stream may yield history in several batches, so
+        # drain them (bounded) instead of keeping only the first one
+        rows, batches = [], 0
+        first = [None]
+
+        def _pull():
+            nonlocal batches
+            try:
+                for closed, forming in it:
+                    if first[0] is None:
+                        first[0] = (closed, forming)
+                    rows.extend(list(closed or []))
+                    batches += 1
+                    if len(rows) >= count:
+                        break
+            except Exception:
+                pass
+
+        th = threading.Thread(target=_pull, daemon=True)
+        th.start()
+        th.join(timeout=5.0)
         try:
             it.stop()
         except Exception:
             pass
-        rows = list(closed or [])
-        if count >= 500:
-            print(f"[candles] {sym} {period}s: want {count}, "
-                  f"legacy {len(partial)}, live {len(rows)}")
-        return rows or partial
+        th.join(timeout=1.0)
+        if not rows and first[0]:
+            rows = list(first[0][0] or [])
+        LAST_FETCH.update({"sym": sym, "period": int(period),
+                           "want": count, "legacy": len(partial),
+                           "live": len(rows), "batches": batches})
+        print(f"[candles] {sym} {period}s: want {count}, "
+              f"legacy {len(partial)}, live {len(rows)} "
+              f"({batches} batches)")
+        return list(rows) or partial
     except Exception as e:
         if count >= 500:
+            LAST_FETCH.update({"sym": sym, "period": int(period),
+                               "want": count, "legacy": len(partial),
+                               "live": -1, "batches": 0})
             print(f"[candles] {sym} {period}s: want {count}, "
                   f"legacy {len(partial)}, live failed ({e})")
         return partial
@@ -288,7 +330,8 @@ def get_closes(asset, period=60, offset=200, ttl=_CLOSES_TTL):
             return list(cached[1]) if cached else None
         if len(closes) < 30:
             return list(cached[1]) if cached else None
-        _CLOSES[key] = (now, closes)
+        if not cached or len(closes) >= len(cached[1]):
+            _CLOSES[key] = (now, closes)
         return list(closes)
 
 
@@ -323,13 +366,20 @@ def get_ohlcv(asset, period=60, offset=220, ttl=_CLOSES_TTL):
         rows = []
         for c in data:
             try:
-                rows.append({"o": float(c["open"]), "h": float(c["high"]),
-                             "l": float(c["low"]), "c": float(c["close"])})
+                cl = float(c["close"])
             except Exception:
                 continue
+            def _f(key, default):
+                try:
+                    return float(c.get(key, default))
+                except Exception:
+                    return default
+            rows.append({"o": _f("open", cl), "h": _f("high", cl),
+                         "l": _f("low", cl), "c": cl})
         if len(rows) < 30:
             return [dict(r) for r in cached[1]] if cached else None
-        _OHLC[key] = (now, rows)
+        if not cached or len(rows) >= len(cached[1]):
+            _OHLC[key] = (now, rows)
         return [dict(r) for r in rows]
 
 
