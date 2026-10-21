@@ -743,20 +743,22 @@ def _ml_learn(pair, features, direction, win):
         label = 0 if win else 1
     else:
         return
-    try:
-        d = _ml_data_load()
-        pr = d["pairs"].setdefault(pair, {"X": [], "y": []})
-        pr["X"].append([round(float(v), 5) for v in features])
-        pr["y"].append(int(label))
-        if len(pr["y"]) > ML_MAX_SAMPLES:
-            pr["X"] = pr["X"][-ML_MAX_SAMPLES:]
-            pr["y"] = pr["y"][-ML_MAX_SAMPLES:]
-        _ml_data_save(d)
-        _ml_learned_since += 1
-        print(f"ML feedback {pair} {direction} -> {'up' if label else 'down'} "
-              f"(+{_ml_learned_since} since last train)")
-    except Exception as e:
-        print("ML learn failed:", e)
+    with _ml_lock:
+        try:
+            d = _ml_data_load()
+            pr = d["pairs"].setdefault(pair, {"X": [], "y": []})
+            pr["X"].append([round(float(v), 5) for v in features])
+            pr["y"].append(int(label))
+            if len(pr["y"]) > ML_MAX_SAMPLES:
+                pr["X"] = pr["X"][-ML_MAX_SAMPLES:]
+                pr["y"] = pr["y"][-ML_MAX_SAMPLES:]
+            _ml_data_save(d)
+            _ml_learned_since += 1
+            print(f"ML feedback {pair} {direction} -> "
+                  f"{'up' if label else 'down'} "
+                  f"(+{_ml_learned_since} since last train)")
+        except Exception as e:
+            print("ML learn failed:", e)
     if _ml_learned_since >= 20:
         ml_train_async(pair, force=True)
 
@@ -876,7 +878,8 @@ def _settle_price(pair, tfi, expire_ts):
             api = pocket_payout._ensure_client()
             if api is not None:
                 sym = pocket_payout.feed_symbol(pocket_payout._norm(pair))
-                raw = pocket_payout._fetch_candles(api, sym, tfi, 60) or []
+                raw = pocket_payout._fetch_candles(api, sym, tfi, 60,
+                                                   block=False) or []
         if raw:
             for row in raw:
                 try:
@@ -958,7 +961,8 @@ def track_text():
 
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
 ACCT_SYNC_GAP = 45.0
-ACCT_SYNC_MAX_DEALS = 12   # bound work per sync so the loop never stalls
+ACCT_SYNC_MAX_DEALS = 12      # bound work per sync so the loop never stalls
+ACCT_FEATURE_ASSETS = 4       # only build ML features for this many assets
 
 
 def _acct_raw(asset, open_ts):
@@ -972,7 +976,8 @@ def _acct_raw(asset, open_ts):
         sym = pocket_payout.feed_symbol(pocket_payout._norm(asset))
         for period in (60, 300, 900, 1800):
             try:
-                raw = pocket_payout._fetch_candles(api, sym, period, 144) or []
+                raw = pocket_payout._fetch_candles(api, sym, period, 144,
+                                                   block=False) or []
             except Exception:
                 raw = []
             if not raw:
@@ -1110,7 +1115,9 @@ def sync_account_trades():
         if not t.get("refund") and t.get("entry"):
             a = t["asset"]
             new_ts[a] = min(new_ts.get(a, 10 ** 12), t["open_ts"])
-    raw_cache = {a: _acct_raw(a, ts0) for a, ts0 in new_ts.items()}
+    raw_cache = {}
+    for a, ts0 in list(new_ts.items())[:ACCT_FEATURE_ASSETS]:
+        raw_cache[a] = _acct_raw(a, ts0)
     for t in trades:
         tid = str(t["id"])
         if tid not in new_seen:
@@ -1139,9 +1146,13 @@ def sync_account_trades():
         print(f"Account {t['asset']} {direction} -> "
               f"{'WIN' if t['win'] else 'LOSS'} ({tag}, profit {t['profit']})")
     if changed:
-        seen.update(new_seen)
-        d["seen_deals"] = sorted(seen)[-500:]
-        _ml_data_save(d)
+        # re-read so feedback written by _ml_learn() is not overwritten
+        with _ml_lock:
+            d = _ml_data_load()
+            seen = set(str(x) for x in (d.get("seen_deals") or []))
+            seen.update(new_seen)
+            d["seen_deals"] = sorted(seen)[-500:]
+            _ml_data_save(d)
         track["settled"] = track["settled"][-200:]
         track_save(track)
 
@@ -1905,6 +1916,7 @@ if __name__ == "__main__":
     sel_time = int(S.get("last_time") or 60)
     auto_on = False
     CURRENT_MODEL = sel_model
+    print(f"Market: {market_label(sel_market)} | {tf_label(sel_time)} | {sel_pair}")
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
@@ -1914,6 +1926,9 @@ if __name__ == "__main__":
     last_state = {}
     auto_tick = 0.0
     acct_tick = 0.0
+    settle_tick = 0.0
+    acct_busy = threading.Lock()
+    settle_busy = threading.Lock()
     last_page = 0
     warm_feed(sel_pair, sel_time, wait=20.0)
     _ml_load()
@@ -2492,14 +2507,26 @@ if __name__ == "__main__":
 
         if time.time() - acct_tick >= ACCT_SYNC_GAP:
             acct_tick = time.time()
-            try:
-                sync_account_trades()
-            except Exception as e:
-                print("account sync failed:", e)
+            if acct_busy.acquire(blocking=False):
+                def _sync_worker():
+                    try:
+                        sync_account_trades()
+                    except Exception as e:
+                        print("account sync failed:", e)
+                    finally:
+                        acct_busy.release()
+                threading.Thread(target=_sync_worker, daemon=True).start()
 
-        try:
-            track_settle()
-        except Exception:
-            pass
+        if time.time() - settle_tick >= 15:
+            settle_tick = time.time()
+            if settle_busy.acquire(blocking=False):
+                def _settle_worker():
+                    try:
+                        track_settle()
+                    except Exception:
+                        pass
+                    finally:
+                        settle_busy.release()
+                threading.Thread(target=_settle_worker, daemon=True).start()
 
         time.sleep(1)

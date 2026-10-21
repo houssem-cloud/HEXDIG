@@ -215,15 +215,20 @@ def get_payout(asset, default=None):
     return v if v is not None else default
 
 
-def _fetch_candles(api, sym, period, count):
+def _fetch_candles(api, sym, period, count, block=True):
     """Historical candles, version-proof.
 
     Uses the legacy `get_candles` (fast, non-blocking) while it exists, and
     transparently falls back to the non-deprecated live backfill
     (`get_candles_live`) once the library removes it. Never leaves a hang: the
-    live path is only tried after the legacy call fails."""
+    live path is only tried after the legacy call fails.
+
+    `block=False` returns [] instead of sleeping when the per-minute candle
+    budget is full - used by low-priority background work so interactive scans
+    always get the budget first."""
     count = int(count)
-    _throttle("candles")
+    if not _throttle("candles", block=block):
+        return []
     legacy = getattr(api, "get_candles", None)
     if legacy is not None:
         try:
