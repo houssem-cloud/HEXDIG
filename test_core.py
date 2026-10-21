@@ -109,7 +109,8 @@ class TestGate(unittest.TestCase):
         self.assertTrue(res["tradeable"])
         self.assertEqual(res["signal"] in ("CALL", "PUT"), True)
 
-    def test_decayed_fold_blocks_trade(self):
+    def test_decayed_report_does_not_veto(self):
+        # a negative/decayed report is informational; the live replay decides
         self._write_report({"bets": 500, "wins": 350, "win_rate": 70.0,
                             "wilson": 66.0, "expectancy": 0.2, "sqn": 2.0,
                             "break_even": 51.3, "payout": 95.0,
@@ -118,9 +119,13 @@ class TestGate(unittest.TestCase):
                                        "wilson": 38.0, "expectancy": -0.05,
                                        "sqn": -1.0, "break_even": 51.3}]})
         res = bot.analyze(synth(300), pair="EURUSD-OTC", period=60)
-        self.assertFalse(res["tradeable"])
-        self.assertEqual(res["signal"], "NO TRADE")
-        self.assertIn("decayed", res["gate_note"])
+        self.assertFalse(res["validated"])
+        if res["tradeable"]:
+            self.assertIn(res["signal"], ("CALL", "PUT"))
+        else:
+            self.assertEqual(res["signal"], "NO TRADE")
+        self.assertIn(res["gate_reason"],
+                      ("edge", "wilson", "fold", "sample", "ok"))
 
 
 class TestFetchCandles(unittest.TestCase):
@@ -209,6 +214,17 @@ class TestReplayGate(unittest.TestCase):
         self.assertFalse(res["tradeable"])
         self.assertIn("fold", res["gate_note"].lower())
 
+    def test_point_mode_skips_wilson_floor(self):
+        orig = bot.GATE_MODE
+        bot.GATE_MODE = "point"
+        try:
+            self._fold(61, 111, [55, 55, 55, 55])   # 54.95% vs be 52.63
+            res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
+            self.assertTrue(res["tradeable"])
+            self.assertIn("point mode", res["gate_note"])
+        finally:
+            bot.GATE_MODE = orig
+
 
 class TestScanner(unittest.TestCase):
     def setUp(self):
@@ -230,8 +246,8 @@ class TestScanner(unittest.TestCase):
         bot.market_pairs = lambda market: [("AAA-OTC", 95.0),
                                            ("BBB-OTC", 50.0),
                                            ("CCC-OTC", 95.0)]
-        bot.fetch_ohlc = lambda pair, period_sec: None
-        bot.get_series = lambda pair, period_sec, fetch=True: ([1.0, 1.1, 1.2], "")
+        bot.fetch_ohlc = lambda pair, period_sec, count=220, ttl=None: None
+        bot.get_series = lambda pair, period_sec, fetch=True, count=220: ([1.0, 1.1, 1.2], "")
 
         def fake_analyze(closes, model=None, news_symbol=None, pair=None,
                          period=None, ohlc=None):
@@ -267,6 +283,54 @@ class TestScanner(unittest.TestCase):
         self.assertTrue(any(p.endswith("-OTC") for p in got))
         self.assertTrue(any(not p.endswith("-OTC") for p in got))
 
+    def test_deep_check_rescores_with_more_history(self):
+        # a 220-bar replay can be too thin; the best candidate is re-scored on
+        # SCAN_HISTORY bars before a card is ever sent
+        bot.market_pairs = lambda market: [("AAA-OTC", 95.0)]
+        bars = [{"o": 1.0, "h": 1.1, "l": 0.9, "c": 1.0 + i * 0.001}
+                for i in range(900)]
+        seen = []
+
+        def fake_ohlc(pair, period_sec, count=220, ttl=None):
+            return bars if count >= 600 else bars[:220]
+
+        def fake_analyze(closes, model=None, news_symbol=None, pair=None,
+                         period=None, ohlc=None):
+            seen.append(len(closes))
+            tr = len(closes) >= 600
+            return {"signal": "CALL" if tr else "NO TRADE",
+                    "full_acc": 60.0 if tr else 50.0, "full_total": len(closes),
+                    "break_even": 52.0, "payout": 95.0, "wilson": 55.0,
+                    "tradeable": tr, "validated": False,
+                    "gate_reason": "ok" if tr else "edge", "gate_note": ""}
+
+        bot.fetch_ohlc = fake_ohlc
+        bot.analyze = fake_analyze
+        res = bot.scan_pairs(60, "otc")
+        self.assertTrue(res[0]["tradeable"])
+        self.assertEqual(res[0]["history"], 900)
+        self.assertIn(900, seen)
+
+    def test_deep_check_never_downgrades_sample(self):
+        bot.market_pairs = lambda market: [("AAA-OTC", 95.0)]
+        broad = [{"o": 1.0, "h": 1.0, "l": 1.0, "c": 1.0} for _ in range(220)]
+        bot.fetch_ohlc = lambda pair, period_sec, count=220, ttl=None: (
+            broad if count <= 220 else broad[:150])
+
+        def fake_analyze(closes, model=None, news_symbol=None, pair=None,
+                         period=None, ohlc=None):
+            return {"signal": "CALL", "full_acc": 60.0,
+                    "full_total": len(closes), "break_even": 52.0,
+                    "payout": 95.0, "wilson": 55.0, "tradeable": True,
+                    "validated": False, "gate_reason": "ok", "gate_note": ""}
+
+        bot.analyze = fake_analyze
+        res = bot.scan_pairs(60, "otc")
+        self.assertTrue(res[0]["tradeable"])
+        self.assertNotIn("history", res[0])
+        self.assertEqual(bot.DEEP_INFO["AAA-OTC"]["kept"], 220)
+        self.assertEqual(bot.DEEP_INFO["AAA-OTC"]["got"], 150)
+
 
 class TestMarketAll(unittest.TestCase):
     def test_all_and_labels(self):
@@ -299,6 +363,29 @@ class TestMarketAll(unittest.TestCase):
             self.assertEqual(bot.load_settings()["market"], "otc")
         finally:
             bot.SETTINGS_FILE = orig
+
+    def test_settings_gate_mode_default_and_normalize(self):
+        tmp = tempfile.mkdtemp()
+        orig = bot.SETTINGS_FILE
+        orig_env = os.environ.pop("GATE_MODE", None)
+        bot.SETTINGS_FILE = os.path.join(tmp, "pocket_settings.json")
+        try:
+            self.assertEqual(bot.load_settings()["gate_mode"], "strict")
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({"gate_mode": "point"}, f)
+            self.assertEqual(bot.load_settings()["gate_mode"], "point")
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({"gate_mode": "bogus"}, f)
+            self.assertEqual(bot.load_settings()["gate_mode"], "strict")
+            os.environ["GATE_MODE"] = "point"
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({}, f)
+            self.assertEqual(bot.load_settings()["gate_mode"], "point")
+        finally:
+            bot.SETTINGS_FILE = orig
+            os.environ.pop("GATE_MODE", None)
+            if orig_env is not None:
+                os.environ["GATE_MODE"] = orig_env
 
     def test_scan_text_empty(self):
         self.assertIn("No pairs", bot.scan_text([], 60, "otc"))
@@ -355,6 +442,19 @@ class TestThrottleRetry(unittest.TestCase):
         self.assertFalse(pp._throttle("__test__", block=False))
         pp._HITS.pop("__test__", None)
         pp._RATE_LIMITS.pop("__test__", None)
+
+    def test_fetch_candles_nonblocking_empty_when_full(self):
+        import pocket_payout as pp
+        orig = pp._RATE_LIMITS.get("candles")
+        try:
+            pp._RATE_LIMITS["candles"] = (1, 60.0)
+            pp._HITS["candles"] = pp.collections.deque([time.time()])
+            self.assertEqual(
+                pp._fetch_candles(None, "EURUSD", 60, 10, block=False), [])
+        finally:
+            if orig:
+                pp._RATE_LIMITS["candles"] = orig
+            pp._HITS.pop("candles", None)
 
     def test_retry_returns_value_and_swallows(self):
         import pocket_payout as pp
@@ -436,6 +536,80 @@ class TestResultNotify(unittest.TestCase):
                             "open_ts": 0, "tf": 60})
         self.assertEqual(len(bot.results_load()), 1)
         self.assertEqual(self.sent, [])
+
+
+class TestReportAge(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.orig = bot.EDGE_REPORT_FILE
+        bot.EDGE_REPORT_FILE = os.path.join(self.tmp, "edge_report.json")
+        bot._EDGE_REPORT.update({"mtime": None, "generated": None, "data": {}})
+
+    def tearDown(self):
+        bot.EDGE_REPORT_FILE = self.orig
+        bot._EDGE_REPORT.update({"mtime": None, "generated": None, "data": {}})
+
+    def _write(self, days_old):
+        gen = time.strftime("%Y-%m-%d %H:%M:%S",
+                            time.localtime(time.time() - days_old * 86400))
+        with open(bot.EDGE_REPORT_FILE, "w") as f:
+            json.dump({"generated": gen,
+                       "pairs": {"EURUSD#60": {"bets": 200,
+                                              "expectancy": 0.02}}}, f)
+
+    def test_stale_report_ignored(self):
+        self._write(10)
+        self.assertIsNone(bot.edge_from_report("EURUSD", 60))
+
+    def test_fresh_report_used(self):
+        self._write(1)
+        rep = bot.edge_from_report("EURUSD", 60)
+        self.assertIsNotNone(rep)
+        self.assertLess(rep["_age_days"], 2)
+
+    def test_reason_text(self):
+        txt = bot.reason_text([{"tradeable": False, "reason": "wilson"},
+                               {"tradeable": False, "reason": "wilson"},
+                               {"tradeable": False, "reason": "edge"},
+                               {"tradeable": True, "reason": "ok"}])
+        self.assertIn("thin floor 2", txt)
+        self.assertIn("edge too small 1", txt)
+
+
+class TestTradingToggle(unittest.TestCase):
+    def test_env_toggle(self):
+        orig = os.environ.get("ALLOW_TRADING")
+        try:
+            os.environ.pop("ALLOW_TRADING", None)
+            self.assertFalse(bot.trading_on())
+            os.environ["ALLOW_TRADING"] = "1"
+            self.assertTrue(bot.trading_on())
+        finally:
+            if orig is None:
+                os.environ.pop("ALLOW_TRADING", None)
+            else:
+                os.environ["ALLOW_TRADING"] = orig
+
+    def test_settings_persist_allow_trading(self):
+        tmp = tempfile.mkdtemp()
+        orig_file = bot.SETTINGS_FILE
+        orig_env = os.environ.pop("ALLOW_TRADING", None)
+        bot.SETTINGS_FILE = os.path.join(tmp, "pocket_settings.json")
+        try:
+            self.assertFalse(bot.load_settings()["allow_trading"])
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({"allow_trading": True}, f)
+            self.assertTrue(bot.load_settings()["allow_trading"])
+            os.environ["ALLOW_TRADING"] = "1"
+            with open(bot.SETTINGS_FILE, "w") as f:
+                json.dump({}, f)
+            self.assertTrue(bot.load_settings()["allow_trading"])
+        finally:
+            bot.SETTINGS_FILE = orig_file
+            if orig_env is None:
+                os.environ.pop("ALLOW_TRADING", None)
+            else:
+                os.environ["ALLOW_TRADING"] = orig_env
 
 
 class TestSafety(unittest.TestCase):

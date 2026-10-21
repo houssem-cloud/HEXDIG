@@ -121,6 +121,8 @@ def load_settings():
         d["model"] = "engine"
     if d.get("market") not in ("stock", "otc", "all"):
         d["market"] = "all"
+    gm = str(d.get("gate_mode") or os.getenv("GATE_MODE", "strict")).lower()
+    d["gate_mode"] = gm if gm in ("strict", "point") else "strict"
     if "allow_trading" not in d:
         d["allow_trading"] = os.getenv("ALLOW_TRADING") == "1"
     else:
@@ -1818,7 +1820,9 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
     comes first, then by how far its measured edge sits above break-even. Pairs
     whose payout is already below MIN_PAYOUT are skipped before any fetch."""
     out = []
-    DEEP_INFO.clear()
+    t0 = time.time()
+    SCAN_TIMING["started"] = t0
+    SCAN_TIMING["running"] = True
     try:
         pairs = market_pairs(market)
     except Exception:
@@ -1946,6 +1950,8 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
     for r in out[:max(1, SCAN_DEEP_N)]:
         _deepen(r)
     out.sort(key=lambda x: (x["tradeable"], x["margin"]), reverse=True)
+    SCAN_TIMING["took"] = time.time() - t0
+    SCAN_TIMING["running"] = False
     return out
 
 
@@ -1954,6 +1960,7 @@ REASON_LABELS = {"report": "negative report", "sample": "too few setups",
                  "fold": "recent fold weak", "payout": "payout/sample"}
 
 DEEP_INFO = {}   # pair -> diagnostics for the last deep re-check
+SCAN_TIMING = {"started": 0.0, "took": 0.0, "running": False}
 
 
 def market_counts(results):
@@ -2060,6 +2067,7 @@ HELP_TEXT = (
     "/auto - Toggle continuous auto-scan alerts\n"
     "/amount N - Set the stake for accepted signals\n"
     "/trading on|off - Enable/disable real orders (persists across restarts)\n"
+    "/gate strict|point - Strict Wilson floor vs point-edge mode\n"
     "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
     "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
@@ -2104,6 +2112,10 @@ if __name__ == "__main__":
         os.environ.pop("ALLOW_TRADING", None)
     print("Trading: " + ("ENABLED (Accept places real orders)"
                          if trading_on() else "display-only"))
+    GATE_MODE = S["gate_mode"]
+    save_settings({"gate_mode": GATE_MODE})
+    print("Gate: " + ("strict (Wilson floor)"
+                      if GATE_MODE == "strict" else "point (+margin)"))
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
@@ -2326,7 +2338,7 @@ if __name__ == "__main__":
                        "model": sel_model, "market": sel_market,
                        "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
                        "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT,
-                       "allow_trading": trading_on()})
+                       "allow_trading": trading_on(), "gate_mode": GATE_MODE})
 
     def send_menu(chat):
         send(f"{screen_head('Spike', 1)}\nSignal engine for Pocket Option.\n"
@@ -2586,6 +2598,26 @@ if __name__ == "__main__":
                      f"{'ENABLED' if trading_on() else 'disabled'}. "
                      "Usage: /trading on | /trading off", chat_id=chat,
                      html_on=True)
+        elif cmd in ("/gate", "gate"):
+            parts = raw.split()
+            arg = parts[1].lower() if len(parts) >= 2 else ""
+            if arg in ("strict", "wilson"):
+                GATE_MODE = "strict"
+                persist()
+                send("\U0001f6e1 <b>Gate: strict</b> \u2014 a pair must clear "
+                     "break-even even on the 95% Wilson floor. Honest, but "
+                     "rarely fires with short history.", chat_id=chat,
+                     html_on=True)
+            elif arg in ("point", "pragmatic"):
+                GATE_MODE = "point"
+                persist()
+                send("\u26a1 <b>Gate: point</b> \u2014 fires when the measured "
+                     "edge clears break-even + margin (no floor). Lower "
+                     "confidence; keep it on demo.", chat_id=chat, html_on=True)
+            else:
+                send(f"Gate is <b>{GATE_MODE}</b>. "
+                     "Usage: /gate strict | /gate point", chat_id=chat,
+                     html_on=True)
         elif cmd in ("/auto", "auto"):
             autoscan["on"] = not autoscan["on"]
             autoscan["chat"] = chat
@@ -2618,11 +2650,17 @@ if __name__ == "__main__":
                 if b:
                     bars = (f" \u00b7 {b['history']} bars"
                             if b.get("history") else "")
+                    took = (f" \u00b7 took {SCAN_TIMING['took']:.0f}s"
+                            if SCAN_TIMING.get("took") else "")
                     lines.append(f"Last scan: {ago}s ago \u00b7 {STATUS['scan_n']} "
                                  f"pairs{split} \u00b7 best "
                                  f"{html.escape(fmt_pair(b['pair']))} "
                                  f"{b['edge']:.0f}% vs "
-                                 f"{(b['break_even'] or 0):.0f}%{bars}")
+                                 f"{(b['break_even'] or 0):.0f}%{bars}{took}")
+                    if SCAN_TIMING.get("running"):
+                        lines.append(
+                            "Scan: running "
+                            f"({int(time.time() - SCAN_TIMING['started'])}s)")
                     if b.get("note"):
                         lines.append(f"Why: {html.escape(b['note'])}")
                     if STATUS.get("blocked"):
