@@ -2450,7 +2450,7 @@ if __name__ == "__main__":
 
     def handle_update(upd):
         global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
-        global TRADE_AMOUNT
+        global TRADE_AMOUNT, GATE_MODE
         if "callback_query" in upd:
             cb = upd["callback_query"]
             cb_id = cb.get("id", "")
