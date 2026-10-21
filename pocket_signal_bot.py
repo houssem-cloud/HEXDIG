@@ -2721,9 +2721,15 @@ if __name__ == "__main__":
                 break
             try:
                 handle_update(upd)
-            except Exception:
+            except Exception as e:
                 import traceback
                 traceback.print_exc()
+                try:
+                    send(f"\u26a0 {type(e).__name__}: {e}",
+                         chat_id=upd.get("message", {}).get("chat", {})
+                         .get("id"))
+                except Exception:
+                    pass
 
         if watch["on"] and time.time() - watch["t"] >= WATCH_REFRESH:
             watch["t"] = time.time()
