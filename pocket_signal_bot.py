@@ -2142,7 +2142,7 @@ if __name__ == "__main__":
               "scan_otc": 0, "scan_stock": 0, "best": None, "last_card": 0.0,
               "blocked": ""}
 
-    AUTOSCAN_GAP = 180
+    AUTOSCAN_GAP = 300
     AUTOSCAN_COOLDOWN = 900
     AUTOSCAN_MAX_PAIRS = 16
     scan_lock = threading.Lock()
