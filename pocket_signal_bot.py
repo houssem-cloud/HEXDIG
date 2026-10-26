@@ -75,6 +75,7 @@ MAX_STAKE_BALANCE_PCT = 5.0  # refuse a stake larger than this % of the balance
 
 # ---- honest edge gate (tunable via pocket_settings.json) ----
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
+MIN_ACCURACY = 60.0    # never show BUY/SELL below this measured accuracy (%)
 MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
 WILSON_Z = float(os.environ.get("WILSON_Z", "1.96"))  # 1.96=95%, 1.28=80%
@@ -512,6 +513,11 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None,
         return out
     ohlc_data = ohlc if ohlc is not None else (fetch_ohlc(pair, period)
                                                if pocket_payout else None)
+    # Single source of truth: closes must come from the same rows as the OHLC
+    # used for high/low, never from a different feed snapshot (mixing sources
+    # produced garbage Stoch/CCI values on the card and could corrupt decisions)
+    if ohlc_data:
+        closes = [float(r["c"]) for r in ohlc_data]
     stk = _indicator_stack(closes, ohlc_data)
     s = stk["s"]
 
@@ -558,6 +564,9 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None,
         if r_bets < MIN_BACKTEST_N:
             report_note = (f"Validated{age} on only {r_bets} bets "
                            f"(need {MIN_BACKTEST_N}).")
+        elif r_wr < MIN_ACCURACY:
+            report_note = (f"Validated{age} win {r_wr:.0f}% is below the "
+                           f"{MIN_ACCURACY:.0f}% accuracy minimum.")
         elif r_exp <= 0:
             report_note = (f"Validated{age} expectancy {r_exp:+.3f}/bet "
                            "is not positive.")
@@ -593,6 +602,10 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None,
             out["gate_reason"] = "sample"
             out["gate_note"] = (f"Only {f_total} resolved setups - need "
                                 f"{MIN_BACKTEST_N} to trust the edge.")
+        elif out["full_acc"] < MIN_ACCURACY:
+            out["gate_reason"] = "accuracy"
+            out["gate_note"] = (f"Measured accuracy {out['full_acc']:.0f}% is "
+                                f"below the {MIN_ACCURACY:.0f}% minimum.")
         elif out["full_acc"] < be + EDGE_MARGIN:
             out["gate_reason"] = "edge"
             out["gate_note"] = (f"Edge {out['full_acc']:.0f}% is not above "
@@ -1784,9 +1797,7 @@ def screen_head(title, step):
     return f"\U0001f7e2 Spike\n\n<b>{title}</b>\n\n{dots}\n"
 
 def kb_menu():
-    return [[{"text": "Start", "callback_data": "ui:market"}],
-            [{"text": "\U0001f50e Find a trade", "callback_data": "scan:run"},
-             {"text": "\U0001f501 Auto-scan", "callback_data": "scan:toggle"}]]
+    return [[{"text": "Start", "callback_data": "ui:market"}]]
 
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
@@ -1823,15 +1834,13 @@ def kb_signal_ctx(pair, signal, period_sec, ts=None):
     if len(cb.encode("utf-8")) > 64:
         cb = f"acc:{pair}:{signal}:{int(period_sec)}"
     return [[{"text": "\u2705 Accept signal", "callback_data": cb}],
-            [{"text": "\U0001f504 Another signal", "callback_data": "sig:again"},
-             {"text": "\U0001f50e Find a trade", "callback_data": "scan:run"}],
+            [{"text": "\U0001f504 Another signal", "callback_data": "sig:again"}],
             [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 
 def kb_signal():
     """Navigation-only keyboard for cards that carry no actionable signal."""
-    return [[{"text": "\U0001f504 Another signal", "callback_data": "sig:again"},
-             {"text": "\U0001f50e Find a trade", "callback_data": "scan:run"}],
+    return [[{"text": "\U0001f504 Another signal", "callback_data": "sig:again"}],
             [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
@@ -1851,6 +1860,13 @@ def tech_metrics(closes, ohlc, res):
            "price": None, "conditions": "Neutral"}
     if not closes or len(closes) < WARMUP_BARS:
         return out
+    # Single source of truth: whatever OHLC was passed in, its own closes are
+    # the closes - mixing them with another feed snapshot produced garbage
+    # Stoch/CCI values on the card (K/D in the thousands).
+    if ohlc:
+        closes = [float(r["c"]) for r in ohlc]
+        if len(closes) < WARMUP_BARS:
+            return out
     stk = _indicator_stack([float(x) for x in closes], ohlc)
     i = len(stk["s"]) - 1
 
@@ -2152,6 +2168,7 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
 
 
 REASON_LABELS = {"report": "negative report", "sample": "too few setups",
+                 "accuracy": "below min accuracy",
                  "edge": "edge too small", "wilson": "thin floor",
                  "fold": "recent fold weak", "payout": "payout/sample"}
 
@@ -2258,8 +2275,7 @@ def gen_text(pct, values):
 
 HELP_TEXT = (
     "/start - Main menu\n"
-    "/scan - Scan every pair for a real edge now\n"
-    "/auto - Toggle continuous auto-scan alerts\n"
+    "/scan - Optional: rank all pairs by measured edge\n"
     "/amount N - Set the stake for accepted signals\n"
     "/trading on|off - Enable/disable real orders (persists across restarts)\n"
     "/gate strict|point - Strict Wilson floor vs point-edge mode\n"
@@ -2270,8 +2286,8 @@ HELP_TEXT = (
     "ADX < 25, gated by the "
     "setup's measured out-of-sample hit-rate vs payout break-even.\n"
     "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
-    "Tap Find a trade to scan all pairs and get pinged only when one clears "
-    "break-even.\n"
+    "BUY/SELL cards are shown only when the setup's measured accuracy is at "
+    "least 60% (and clears break-even + margin over enough history).\n"
     "Accept signal places a real order only when trading is enabled with "
     "/trading on (and your SSID is saved). Otherwise it is display-only.\n"
     "Daily risk stop: Accept pauses after the configured realized loss "
@@ -2304,7 +2320,6 @@ if __name__ == "__main__":
     sel_market = str(S.get("market") or "all")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
-    auto_on = False
     CURRENT_MODEL = sel_model
     print(f"Market: {market_label(sel_market)} | {tf_label(sel_time)} | {sel_pair}")
     if S.get("allow_trading"):
@@ -2318,6 +2333,7 @@ if __name__ == "__main__":
     print("Gate: " + ("strict (Wilson floor)"
                       if GATE_MODE == "strict" else "point (+margin)"))
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
+    MIN_ACCURACY = float(S.get("min_accuracy", MIN_ACCURACY))
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     TRADE_AMOUNT = max(0.01, float(S.get("trade_amount", TRADE_AMOUNT)))
@@ -2335,7 +2351,6 @@ if __name__ == "__main__":
     owner_id = (str(os.getenv("TELEGRAM_OWNER_ID") or "").strip()
                 or (None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)))
     last_state = {}
-    auto_tick = 0.0
     acct_tick = 0.0
     settle_tick = 0.0
     acct_busy = threading.Lock()
@@ -2354,23 +2369,8 @@ if __name__ == "__main__":
               "scan_otc": 0, "scan_stock": 0, "best": None, "last_card": 0.0,
               "blocked": ""}
 
-    AUTOSCAN_GAP = 300
-    AUTOSCAN_COOLDOWN = 900
     AUTOSCAN_MAX_PAIRS = 16
     scan_lock = threading.Lock()
-    scan_state = {"alerted": {}}
-    autoscan = {"on": False, "chat": None, "t": 0.0}
-
-    def _emit_signal(chat, pair, period_sec, res, closes):
-        m = tech_metrics(closes, fetch_ohlc(pair, period_sec), res)
-        mid = send(autoscan_card_text(res, m, pair, tf_label(period_sec)), chat_id=chat,
-                   keyboard=kb_signal_ctx(pair, res["signal"], period_sec),
-                   html_on=True)
-        STATUS["last_card"] = time.time()
-        remember_signal(mid, res, pair, period_sec, m.get("price"))
-        track_add(pair, period_sec, res["signal"], m.get("price"), sel_model,
-                  res.get("regime"), features=_feat_last(closes))
-
     def run_scan(chat):
         mid = send(f"\U0001f50e Scanning {market_label(sel_market)} pairs for a real edge\u2026",
                    chat_id=chat, html_on=True)
@@ -2495,52 +2495,6 @@ if __name__ == "__main__":
             send(f"\u274c <b>Order failed</b>: {html.escape(str(msg))}",
                  chat_id=chat, html_on=True)
 
-    def autoscan_tick():
-        chat = autoscan["chat"]
-
-        def worker():
-            if not scan_lock.acquire(blocking=False):
-                return
-            try:
-                results = scan_pairs(sel_time, sel_market, AUTOSCAN_MAX_PAIRS)
-                STATUS["last_scan"] = time.time()
-                STATUS["scan_n"] = len(results)
-                STATUS["scan_otc"], STATUS["scan_stock"] = market_counts(results)
-                STATUS["blocked"] = reason_text(results)
-                STATUS["best"] = results[0] if results else None
-                if results:
-                    top = results[0]
-                    blocked = ("" if top["tradeable"]
-                               else f" \u00b7 blocked: {STATUS['blocked']}")
-                    hist = (f" [deep {top['history']} bars]"
-                            if top.get("history") else "")
-                    print(f"[autoscan] {market_label(sel_market)}: "
-                          f"{len(results)} pairs "
-                          f"({STATUS['scan_otc']} OTC / "
-                          f"{STATUS['scan_stock']} stock), best "
-                          f"{top['pair']} {top['edge']:.0f}% vs "
-                          f"{top['break_even'] or 0:.0f}%{hist} "
-                          f"({'TRADEABLE' if top['tradeable'] else 'no edge'})"
-                          f"{blocked}")
-                else:
-                    print("[autoscan] no usable pairs")
-                now = time.time()
-                for r in results:
-                    if not r["tradeable"]:
-                        continue
-                    if now - scan_state["alerted"].get(r["pair"], 0) < AUTOSCAN_COOLDOWN:
-                        continue
-                    scan_state["alerted"][r["pair"]] = now
-                    _emit_signal(chat, r["pair"], sel_time, r["res"], r["closes"])
-                    print(f"[autoscan] alert {r['signal']} {r['pair']} "
-                          f"{r['edge']:.0f}% vs {r['break_even']:.0f}%")
-            except Exception as e:
-                print("autoscan failed:", e)
-            finally:
-                scan_lock.release()
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def start_watch(chat):
         watch["on"] = True
         watch["chat"] = chat
@@ -2566,9 +2520,10 @@ if __name__ == "__main__":
         watch["msg"] = None
 
     def persist():
-        save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": auto_on,
+        save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": False,
                        "model": sel_model, "market": sel_market,
-                       "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
+                       "edge_margin": EDGE_MARGIN, "min_accuracy": MIN_ACCURACY,
+                       "min_backtest_n": MIN_BACKTEST_N,
                        "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT,
                        "daily_max_loss": DAILY_MAX_LOSS,
                        "daily_max_trades": DAILY_MAX_TRADES,
@@ -2683,7 +2638,7 @@ if __name__ == "__main__":
     _processed_cbs = set()
 
     def handle_update(upd):
-        global owner_id, sel_model, sel_market, sel_pair, sel_time, auto_on, last_page
+        global owner_id, sel_model, sel_market, sel_pair, sel_time, last_page
         global TRADE_AMOUNT, GATE_MODE
         if "callback_query" in upd:
             cb = upd["callback_query"]
@@ -2708,10 +2663,6 @@ if __name__ == "__main__":
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
                 persist()
-                if autoscan["on"]:
-                    send(f"\U0001f310 Market set to <b>{market_label(sel_market)}</b> "
-                         f"\u2014 auto-scan now covers it.", chat_id=chat,
-                         html_on=True)
                 mid = cb.get("message", {}).get("message_id")
                 send_pair_screen(chat, 0, edit_mid=mid)
             elif data.startswith("pg:"):
@@ -2760,17 +2711,6 @@ if __name__ == "__main__":
                          chat_id=chat)
             elif data == "scan:run":
                 run_scan(chat)
-            elif data == "scan:toggle":
-                autoscan["on"] = not autoscan["on"]
-                autoscan["chat"] = chat
-                autoscan["t"] = 0.0
-                if autoscan["on"]:
-                    send(f"\U0001f501 <b>Auto-scan ON</b> \u2014 {market_label(sel_market)}, "
-                         f"{tf_label(sel_time)}. I'll check every "
-                         f"{AUTOSCAN_GAP}s and message you only when a pair clears "
-                         f"break-even.", chat_id=chat, html_on=True)
-                else:
-                    send("\U0001f501 Auto-scan OFF.", chat_id=chat)
             elif data == "w:stop":
                 stop_watch(chat)
             return
@@ -2793,8 +2733,6 @@ if __name__ == "__main__":
         if cmd in ("/start", "start"):
             send_menu(chat)
         elif cmd in ("/stop", "stop"):
-            auto_on = False
-            autoscan["on"] = False
             persist()
             if watch["on"]:
                 stop_watch(chat)
@@ -2852,12 +2790,6 @@ if __name__ == "__main__":
                 send(f"Gate is <b>{GATE_MODE}</b>. "
                      "Usage: /gate strict | /gate point", chat_id=chat,
                      html_on=True)
-        elif cmd in ("/auto", "auto"):
-            autoscan["on"] = not autoscan["on"]
-            autoscan["chat"] = chat
-            autoscan["t"] = 0.0
-            send(f"\U0001f501 Auto-scan {'ON' if autoscan['on'] else 'OFF'}.",
-                 chat_id=chat)
         elif cmd in ("/status", "status"):
             up = int(time.time() - STATUS["started"])
             h, rem = divmod(up, 3600)
@@ -2866,7 +2798,6 @@ if __name__ == "__main__":
                      f"Uptime: {h}h {mnt}m",
                      f"Market: {market_label(sel_market)} \u00b7 {tf_label(sel_time)} "
                      f"\u00b7 {html.escape(fmt_pair(sel_pair))}",
-                     f"Auto-scan: {'ON' if autoscan['on'] else 'off'}",
                      f"Watch: {'ON' if watch['on'] else 'off'}",
                       "Trading: " + ("ENABLED (real orders)"
                                      if trading_on()
@@ -2911,7 +2842,7 @@ if __name__ == "__main__":
                     lines.append(f"Last scan: {ago}s ago \u00b7 no usable pairs "
                                  "(check payout/SSID)")
             else:
-                lines.append("Last scan: none yet \u2014 tap Find a trade")
+                lines.append("Last scan: none yet — /scan ranks all pairs")
             if pocket_payout is not None:
                 try:
                     st, age = pocket_payout.feed_status(sel_pair, sel_time)
@@ -2990,30 +2921,6 @@ if __name__ == "__main__":
                               globals().get("sel_model", "engine"),
                               st.get("regime"), features=_feat_last(closes_w))
                     print(f"Watch alert {st['signal']} {sel_pair}")
-
-        if autoscan["on"] and autoscan["chat"] and time.time() - autoscan["t"] >= AUTOSCAN_GAP:
-            autoscan["t"] = time.time()
-            autoscan_tick()
-
-        if auto_on and owner_id and time.time() - auto_tick >= 60:
-            auto_tick = time.time()
-            if pocket_payout is not None and pocket_payout.live_closes(sel_pair, sel_time) is None:
-                warm_feed(sel_pair, sel_time)
-            closes, note = get_series(sel_pair, sel_time, fetch=True)
-            if note or not closes:
-                continue
-            res = analyze(closes, sel_model, pair=sel_pair, period=sel_time)
-            if res["signal"] in ("CALL", "PUT") and res.get("setup"):
-                key = f"{sel_pair}#{sel_time}#{sel_model}"
-                if time.time() - last_state.get(key, 0) >= COOLDOWN_SEC:
-                    last_state[key] = time.time()
-                    ohlc = fetch_ohlc(sel_pair, sel_time)
-                    m = tech_metrics(closes, ohlc, res)
-                    send_card(owner_id, res, m, gate_score(res), closes)
-                    track_add(sel_pair, sel_time, res["signal"], m.get("price"),
-                              sel_model, res.get("regime"),
-                              features=_feat_last(closes))
-                    print(f"Auto {res['signal']} {sel_pair} {tf_label(sel_time)}")
 
         if time.time() - acct_tick >= ACCT_SYNC_GAP:
             acct_tick = time.time()

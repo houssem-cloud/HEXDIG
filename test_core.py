@@ -215,10 +215,17 @@ class TestReplayGate(unittest.TestCase):
             "acc": wins / total * 100.0, "accs": accs}
 
     def test_thin_floor_blocks(self):
-        self._fold(55, 100, [55, 55, 55, 55])   # 55% but floor ~45%
+        self._fold(62, 100, [62, 62, 62, 62])   # 62% acc but floor ~52% < be 52.63
         res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
         self.assertFalse(res["tradeable"])
         self.assertIn("floor", res["gate_note"])
+
+    def test_below_min_accuracy_blocks(self):
+        self._fold(55, 100, [55, 55, 55, 55])   # 55% < MIN_ACCURACY 60
+        res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
+        self.assertFalse(res["tradeable"])
+        self.assertEqual(res["gate_reason"], "accuracy")
+        self.assertIn("minimum", res["gate_note"])
 
     def test_strong_floor_trades(self):
         self._fold(70, 100, [70, 70, 70, 70])
@@ -235,7 +242,7 @@ class TestReplayGate(unittest.TestCase):
         orig = bot.GATE_MODE
         bot.GATE_MODE = "point"
         try:
-            self._fold(61, 111, [55, 55, 55, 55])   # 54.95% vs be 52.63
+            self._fold(68, 110, [68, 68, 68, 68])   # 61.8% acc, thin floor
             res = bot.analyze(synth(300), pair="ZARUSD-OTC", period=60)
             self.assertTrue(res["tradeable"])
             self.assertIn("point mode", res["gate_note"])
