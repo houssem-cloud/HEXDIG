@@ -1,0 +1,12 @@
+services:
+  po-bot:
+    build: ..
+    container_name: po-bot
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

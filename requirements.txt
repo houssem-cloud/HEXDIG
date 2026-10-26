@@ -1,0 +1,8 @@
+# Unpinned (minimums only) — pinned exact versions have no prebuilt wheels
+# for very new Python versions (e.g. 3.15) and try to compile pandas/numpy
+# from source, which fails without a C build toolchain.
+python-telegram-bot>=21.10
+yfinance>=0.2.54
+pandas>=2.2
+numpy>=1.26
+python-dotenv>=1.0
