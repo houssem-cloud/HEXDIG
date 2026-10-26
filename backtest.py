@@ -262,6 +262,8 @@ def verdict(s):
     """Mirror the live bot's edge gate so the CLI never contradicts it."""
     if s["bets"] < 30:
         return "too few bets"
+    if s["win_rate"] >= 95.0:
+        return "SUSPICIOUS: win-rate >= 95% reads like a broken/synthetic feed"
     if s["expectancy"] <= 0:
         return "no edge"
     if s["wilson"] < s["break_even"]:
@@ -373,3 +375,10 @@ def _run_one(pair, df, ohlc, payout, args, results):
 
 if __name__ == "__main__":
     main()
+    # BinaryOptionsToolsV2 keeps native websocket threads alive after the
+    # report is written; interpreter shutdown can segfault (core dumped)
+    # even on a successful run. The report is already on disk, so exit
+    # hard and clean.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
