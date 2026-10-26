@@ -373,15 +373,15 @@ class TestMarketAll(unittest.TestCase):
                                             {"pair": "GBPUSD"},
                                             {"pair": "AUDCAD-OTC"}]), (2, 1))
 
-    def test_settings_keep_all_and_default_all(self):
+    def test_settings_legacy_all_migrates_to_otc(self):
         tmp = tempfile.mkdtemp()
         orig = bot.SETTINGS_FILE
         bot.SETTINGS_FILE = os.path.join(tmp, "pocket_settings.json")
         try:
-            self.assertEqual(bot.load_settings()["market"], "all")
+            self.assertEqual(bot.load_settings()["market"], "otc")
             with open(bot.SETTINGS_FILE, "w") as f:
-                json.dump({"market": "all"}, f)
-            self.assertEqual(bot.load_settings()["market"], "all")
+                json.dump({"market": "all"}, f)   # legacy "Both" -> migrates
+            self.assertEqual(bot.load_settings()["market"], "otc")
             with open(bot.SETTINGS_FILE, "w") as f:
                 json.dump({"market": "otc"}, f)
             self.assertEqual(bot.load_settings()["market"], "otc")

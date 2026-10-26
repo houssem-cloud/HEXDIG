@@ -76,7 +76,10 @@ MAX_STAKE_BALANCE_PCT = 5.0  # refuse a stake larger than this % of the balance
 # ---- honest edge gate (tunable via pocket_settings.json) ----
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
 MIN_ACCURACY = 60.0    # never show BUY/SELL below this measured accuracy (%)
-MIN_BACKTEST_N = 100   # minimum resolved setups before the edge is trusted
+MIN_BACKTEST_N = 40    # minimum resolved setups before the edge is trusted
+# (1m broker history tops out ~2,200 bars -> ~40 setups for this rule; below
+#  N=40 the Wilson floor itself demands ~70%+ accuracy to clear break-even,
+#  so small samples stay safe)
 MIN_PAYOUT = 60.0      # assets paying less than this are never signalled
 WILSON_Z = float(os.environ.get("WILSON_Z", "1.96"))  # 1.96=95%, 1.28=80%
 GATE_MODE = os.environ.get("GATE_MODE", "strict").strip().lower()
@@ -149,7 +152,7 @@ def _atomic_write(path, text):
 # ===== settings persistence =====
 def load_settings():
     d = {"last_pair": "EURUSD-OTC", "last_time": 60, "auto": False,
-         "model": "engine", "market": "all"}
+         "model": "engine", "market": "otc"}
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE) as f:
@@ -158,8 +161,9 @@ def load_settings():
             pass
     if d.get("model") not in MODEL_PARAMS:
         d["model"] = "engine"
-    if d.get("market") not in ("stock", "otc", "all"):
-        d["market"] = "all"
+    # "all" (Both OTC+Stock) was removed from the UI; migrate any legacy saves
+    if d.get("market") not in ("stock", "otc"):
+        d["market"] = "otc"
     gm = str(d.get("gate_mode") or os.getenv("GATE_MODE", "strict")).lower()
     d["gate_mode"] = gm if gm in ("strict", "point") else "strict"
     if "allow_trading" not in d:
@@ -1802,7 +1806,6 @@ def kb_menu():
 def kb_market():
     return [[{"text": "Stock", "callback_data": "mkt:stock"},
              {"text": "OTC", "callback_data": "mkt:otc"}],
-            [{"text": "\U0001f310 Both (OTC + Stock)", "callback_data": "mkt:all"}],
             [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
 
 def kb_pairs(page, pairs, per=8):
@@ -2297,7 +2300,7 @@ HELP_TEXT = (
     "CCI 25, ADX (smoothing 1, DI 5) - band-tag reversal setups only while "
     "ADX < 25, gated by the "
     "setup's measured out-of-sample hit-rate vs payout break-even.\n"
-    "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
+    "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
     "BUY/SELL cards are shown only when the setup's measured accuracy is at "
     "least 60% (and clears break-even + margin over enough history).\n"
     "Accept signal places a real order only when trading is enabled with "
@@ -2329,7 +2332,7 @@ if __name__ == "__main__":
     print("Bot starting (SPIKE UI, live feed, on-demand signals)...")
     S = load_settings()
     sel_model = str(S.get("model") or "engine")
-    sel_market = str(S.get("market") or "all")
+    sel_market = str(S.get("market") or "otc")
     sel_pair = str(S.get("last_pair") or "EURUSD-OTC")
     sel_time = int(S.get("last_time") or 60)
     CURRENT_MODEL = sel_model
@@ -2346,7 +2349,7 @@ if __name__ == "__main__":
                       if GATE_MODE == "strict" else "point (+margin)"))
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_ACCURACY = float(S.get("min_accuracy", MIN_ACCURACY))
-    MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
+    MIN_BACKTEST_N = max(30, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     TRADE_AMOUNT = max(0.01, float(S.get("trade_amount", TRADE_AMOUNT)))
     DAILY_MAX_LOSS = max(1.0, float(S.get("daily_max_loss", DAILY_MAX_LOSS)))
@@ -2677,6 +2680,8 @@ if __name__ == "__main__":
                 send_market_screen(chat, edit_mid=mid)
             elif data.startswith("mkt:"):
                 sel_market = data.split(":", 1)[1]
+                if sel_market == "all":   # stale button from an old keyboard
+                    sel_market = "otc"
                 persist()
                 mid = cb.get("message", {}).get("message_id")
                 send_pair_screen(chat, 0, edit_mid=mid)
