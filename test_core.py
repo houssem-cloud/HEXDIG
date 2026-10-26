@@ -107,7 +107,24 @@ class TestGate(unittest.TestCase):
         res = bot.analyze(synth(300), pair="EURUSD-OTC", period=60)
         self.assertTrue(res["validated"])
         self.assertTrue(res["tradeable"])
-        self.assertEqual(res["signal"] in ("CALL", "PUT"), True)
+        # confluence rule: a validated edge only becomes CALL/PUT when the
+        # setup itself exists on the current bar, else an honest NO TRADE
+        self.assertIn(res["signal"], ("CALL", "PUT", "NO TRADE"))
+
+    def test_tradeable_without_current_setup_is_no_trade(self):
+        self._write_report({"bets": 500, "wins": 350, "win_rate": 70.0,
+                            "wilson": 66.0, "expectancy": 0.2, "sqn": 2.0,
+                            "break_even": 51.3, "payout": 95.0,
+                            "max_drawdown_pct": 10.0, "profit_factor": 1.6,
+                            "folds": []})
+        res = bot.analyze(synth(300), pair="EURUSD-OTC", period=60)
+        self.assertTrue(res["tradeable"])
+        # if there is a vote the signal matches it; otherwise NO TRADE
+        if res["setup"]:
+            self.assertIn(res["signal"], ("CALL", "PUT"))
+        else:
+            self.assertEqual(res["signal"], "NO TRADE")
+            self.assertIn("confluence", res["gate_note"])
 
     def test_decayed_report_does_not_veto(self):
         # a negative/decayed report is informational; the live replay decides
@@ -250,7 +267,7 @@ class TestScanner(unittest.TestCase):
         bot.get_series = lambda pair, period_sec, fetch=True, count=220: ([1.0, 1.1, 1.2], "")
 
         def fake_analyze(closes, model=None, news_symbol=None, pair=None,
-                         period=None, ohlc=None):
+                         period=None, ohlc=None, z_mult=1.0):
             tr = pair in tradeable_pairs
             return {"signal": "CALL" if tr else "NO TRADE",
                     "full_acc": 60.0 if tr else 45.0, "full_total": 200,
@@ -295,7 +312,7 @@ class TestScanner(unittest.TestCase):
             return bars if count >= 600 else bars[:220]
 
         def fake_analyze(closes, model=None, news_symbol=None, pair=None,
-                         period=None, ohlc=None):
+                         period=None, ohlc=None, z_mult=1.0):
             seen.append(len(closes))
             tr = len(closes) >= 600
             return {"signal": "CALL" if tr else "NO TRADE",
@@ -318,7 +335,7 @@ class TestScanner(unittest.TestCase):
             broad if count <= 220 else broad[:150])
 
         def fake_analyze(closes, model=None, news_symbol=None, pair=None,
-                         period=None, ohlc=None):
+                         period=None, ohlc=None, z_mult=1.0):
             return {"signal": "CALL", "full_acc": 60.0,
                     "full_total": len(closes), "break_even": 52.0,
                     "payout": 95.0, "wilson": 55.0, "tradeable": True,
@@ -619,6 +636,100 @@ class TestSafety(unittest.TestCase):
         ok, msg = pocket_payout.place_trade("EURUSD", "CALL", 1, 60)
         self.assertFalse(ok)
         self.assertIn("disabled", msg.lower())
+
+
+class TestRuleSetup(unittest.TestCase):
+    """The confluence rule fires exactly on a confirmed setup, else None."""
+
+    @staticmethod
+    def _series(vals, n):
+        import pandas as pd
+        base = pd.Series([1.0] * n)
+        out = {key: pd.Series([1.0] * n)
+               for key in ("s", "high", "low", "lower2", "upper2", "lower3",
+                           "upper3", "stoch_k", "stoch_d", "cci", "adx")}
+        out.update({k: pd.Series(v) for k, v in vals.items()})
+        return out
+
+    def test_flat_market_has_no_setup(self):
+        i = bot.WARMUP_BARS + 4
+        series = self._series({}, i + 1)
+        self.assertIsNone(bot.decide_at(series, i,
+                                        bot.MODEL_PARAMS["engine"]))
+
+    def _call_series(self, adx=10.0):
+        i = bot.WARMUP_BARS + 4
+        n = i + 1
+        return self._series({
+            "lower2": [1.0] * (n - 1) + [1.0005],  # band tagged by price
+            "upper2": [1.2] * n, "upper3": [1.5] * n,
+            "lower3": [1.0] * (n - 1) + [0.995],   # not a falling knife
+            "stoch_k": [5.0] * (n - 1) + [12.0],   # oversold, hooking up
+            "stoch_d": [7.0] * n,
+            "cci": [-150.0] * (n - 1) + [-120.0],  # <= -100, turning up
+            "adx": [adx] * n,                       # ranging vs runaway trend
+            "low": [1.0] * (n - 1) + [0.9995],     # wick pierces the band
+        }, n), i
+
+    def _put_series(self, adx=10.0):
+        i = bot.WARMUP_BARS + 4
+        n = i + 1
+        return self._series({
+            "upper2": [1.0] * (n - 1) + [0.9995],  # band tagged by price
+            "lower2": [0.8] * n, "lower3": [0.5] * n,
+            "upper3": [1.0] * (n - 1) + [1.005],   # not a rocket close
+            "stoch_k": [95.0] * (n - 1) + [88.0],  # overbought, hooking down
+            "stoch_d": [90.0] * n,
+            "cci": [150.0] * (n - 1) + [120.0],    # >= 100, turning down
+            "adx": [adx] * n,
+            "high": [1.0] * (n - 1) + [1.0005],    # wick pierces the band
+        }, n), i
+
+    def test_call_setup(self):
+        series, i = self._call_series()
+        self.assertEqual(bot.decide_at(series, i,
+                                       bot.MODEL_PARAMS["engine"]), "CALL")
+
+    def test_strong_trend_blocks_reversal(self):
+        series, i = self._call_series(adx=40.0)
+        self.assertIsNone(bot.decide_at(series, i,
+                                        bot.MODEL_PARAMS["engine"]))
+
+    def test_put_setup(self):
+        series, i = self._put_series()
+        self.assertEqual(bot.decide_at(series, i,
+                                       bot.MODEL_PARAMS["engine"]), "PUT")
+
+
+class TestRiskStop(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.orig = bot.RISK_FILE
+        bot.RISK_FILE = os.path.join(self.tmp, "risk_state.json")
+        self._loss, self._cap = bot.DAILY_MAX_LOSS, bot.DAILY_MAX_TRADES
+        bot.DAILY_MAX_LOSS = 10.0
+        bot.DAILY_MAX_TRADES = 3
+
+    def tearDown(self):
+        bot.RISK_FILE = self.orig
+        bot.DAILY_MAX_LOSS, bot.DAILY_MAX_TRADES = self._loss, self._cap
+
+    def test_fresh_day_not_blocked(self):
+        self.assertFalse(bot.risk_daily_block())
+
+    def test_loss_stop_blocks(self):
+        bot.risk_note_outcome(-11.0)
+        self.assertTrue(bot.risk_daily_block())
+
+    def test_order_cap_blocks(self):
+        for _ in range(bot.DAILY_MAX_TRADES):
+            bot.risk_note_outcome(0.95)
+        self.assertTrue(bot.risk_daily_block())
+
+    def test_profit_keeps_gate_open(self):
+        bot.risk_note_outcome(0.95)
+        bot.risk_note_outcome(-0.5)
+        self.assertFalse(bot.risk_daily_block())
 
 
 if __name__ == "__main__":

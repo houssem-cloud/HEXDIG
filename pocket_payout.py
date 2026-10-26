@@ -480,8 +480,10 @@ def _live_row(asset, period, max_age=_LIVE_MAX_AGE):
     return row
 
 
-def live_closes(asset, period=60, max_age=_LIVE_MAX_AGE):
-    """Closes including the live FORMING candle as the last bar. None if no fresh stream."""
+def live_closes(asset, period=60, max_age=_LIVE_MAX_AGE, include_forming=True):
+    """Closes from the live stream; with include_forming=False the last bar is
+    the most recent CLOSED candle (what signal evaluation should use).
+    None if no fresh stream."""
     row = _live_row(asset, period, max_age)
     if not row:
         return None
@@ -492,7 +494,7 @@ def live_closes(asset, period=60, max_age=_LIVE_MAX_AGE):
             closes.append(float(c["close"]))
         except Exception:
             continue
-    if forming:
+    if forming and include_forming:
         try:
             closes.append(float(forming["close"]))
         except Exception:
@@ -500,14 +502,15 @@ def live_closes(asset, period=60, max_age=_LIVE_MAX_AGE):
     return closes if len(closes) >= 30 else None
 
 
-def live_ohlcv(asset, period=60, max_age=_LIVE_MAX_AGE):
-    """OHLC including the live forming candle. None if no fresh stream."""
+def live_ohlcv(asset, period=60, max_age=_LIVE_MAX_AGE, include_forming=True):
+    """OHLC from the live stream; with include_forming=False the last row is
+    the most recent CLOSED candle. None if no fresh stream."""
     row = _live_row(asset, period, max_age)
     if not row:
         return None
     _, closed, forming = row
     rows = []
-    for c in list(closed) + ([forming] if forming else []):
+    for c in list(closed) + ([forming] if forming and include_forming else []):
         try:
             rows.append({"o": float(c["open"]), "h": float(c["high"]),
                          "l": float(c["low"]), "c": float(c["close"])})
@@ -615,6 +618,19 @@ def place_trade(asset, direction, amount, tf):
     if os.getenv("ALLOW_TRADING") != "1":
         return False, ("Trading is disabled. This is a display-only bot; set "
                        "ALLOW_TRADING=1 only if you really intend to trade.")
+    # separate guard: refuse REAL-money accounts unless explicitly unlocked
+    if os.getenv("ALLOW_REAL") != "1":
+        demo = None
+        try:
+            api_probe = _ensure_client()
+            if api_probe is not None:
+                demo = bool(api_probe.is_demo())
+        except Exception:
+            demo = None
+        if demo is False:
+            return False, ("Linked account is a REAL account. Order refused. "
+                           "Set ALLOW_REAL=1 only if you truly want real "
+                           "money orders.")
     api = _ensure_client()
     if api is None:
         return False, "Account not linked (save SSID first)."

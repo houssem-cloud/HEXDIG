@@ -5,10 +5,11 @@ Flow:  /start  ->  Start  ->  Select a market (Stock/OTC)
        ->  Select a currency pair  ->  Select trading time
        ->  Signal Generation...  ->  BUY/SELL or NO TRADE card
 
-One signal engine: a transparent rule vote confirmed by a single classifier
-scored with rolling walk-forward validation. Data is the live tick stream via
-SSID (pocket_payout.py); the last bar is the CURRENT price. The decision rule
-is replayed over the pair's own history and its out-of-sample hit-rate is
+One signal engine: a confluence reversal rule - price tags Bollinger 20/2
+(with Bollinger 20/3 as the "extreme" guard), Stochastic 6/3/3 confirms the
+oversold/overbought hook, CCI 25 must be beyond +/-100 and turning, and
+ADX (smoothing 1, DI 5) must be below 25 (never fade a runaway trend). The setup is replayed
+causally over the pair's own history and its out-of-sample hit-rate is
 compared to the payout break-even. A BUY/SELL card is shown ONLY when that edge
 clears break-even; otherwise the bot says NO TRADE.
 
@@ -40,7 +41,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PASTE_CHAT_ID_NUMBER")
 
 PERIOD = 20
-STD_MULT = 2.0
+STD_MULT = 2.0        # first Bollinger set: period 20, deviation 2
+STD_MULT_OUTER = 3.0  # second Bollinger set: period 20, deviation 3
 COOLDOWN_SEC = 60
 SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "pocket_settings.json")
 
@@ -49,6 +51,27 @@ RSI_PERIOD = 14
 # option bought now that expires `sel_time` seconds later.
 HORIZON = 1
 SQUEEZE_PCT = 40
+
+# ---- chart-setup indicators (replace the old EMA/MACD/RSI vote) ----
+STOCH_K = 6           # Stochastic %K period (picture: 6)
+STOCH_D = 3           # Stochastic %D period   (picture: 3)
+STOCH_SMOOTH = 3      # %K smoothing period, SMA (picture: 3)
+STOCH_OS = 20.0       # oversold / overbought bands
+STOCH_OB = 80.0
+CCI_PERIOD = 25
+CCI_OS = -100.0
+CCI_OB = 100.0
+ADX_SMOOTHING = 1     # TradingView "ADX Smoothing" (picture: 1 -> raw DX)
+ADX_DI_LEN = 5        # TradingView "DI Length"      (picture: 5)
+ADX_TREND = 25.0      # no reversal setups while the move is this strong
+WARMUP_BARS = max(PERIOD + 10, CCI_PERIOD + 10,
+                  ADX_DI_LEN * 4 + ADX_SMOOTHING + 10,
+                  STOCH_K + STOCH_SMOOTH + STOCH_D + 10)
+
+# ---- daily risk limits (overridable in pocket_settings.json) ----
+DAILY_MAX_LOSS = 10.0     # units; Accept refuses once today's realized P/L <= -this
+DAILY_MAX_TRADES = 30     # hard cap of accepted orders per calendar day
+MAX_STAKE_BALANCE_PCT = 5.0  # refuse a stake larger than this % of the balance
 
 # ---- honest edge gate (tunable via pocket_settings.json) ----
 EDGE_MARGIN = 2.0      # measured hit-rate must beat break-even by this many %
@@ -80,12 +103,13 @@ def remember_signal(mid, res, pair, period, price):
         for k in oldest[:100]:
             PENDING_SIGNALS.pop(k, None)
 
-# Single engine: one transparent rule vote, gated by that same rule's measured
+# Single engine: the chart-setup confluence rule, gated by its measured
 # out-of-sample hit-rate vs. the payout break-even. The previous six "models"
 # were cosmetic weight variants with no measured edge, so they were removed.
-ENGINE_WEIGHTS = (2, 2, 1, 1)
+ENGINE_WEIGHTS = (1,)  # unused by the confluence rule; kept for signature compat
 MODEL_PARAMS = {
-    "engine": {"w": ENGINE_WEIGHTS, "label": "Rule vote + validated edge gate"},
+    "engine": {"w": ENGINE_WEIGHTS,
+               "label": "BB 20/2 + 20/3 · Stoch 6/3/3 · CCI 25 · ADX (1,5)"},
 }
 MODELS = ["engine"]
 MODEL_NAMES = {"engine": "Engine"}
@@ -106,6 +130,20 @@ DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZ
                  "GBPCAD", "GBPAUD", "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "NZDCAD",
                  "NZDCHF", "NZDJPY", "CADCHF", "CADJPY", "CHFJPY", "EURNZD", "USDSGD",
                  "USDHKD", "USDCNH"]
+
+# ===== concurrent-safe state files =====
+# Several threads (settler, account sync, Telegram loop) load-modify-save the
+# JSON state files. All cycles are serialized here and every save is atomic
+# (write temp file, then rename) so a crash can no longer half-write a file.
+_STATE_LOCK = threading.RLock()
+
+
+def _atomic_write(path, text):
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
 
 # ===== settings persistence =====
 def load_settings():
@@ -135,16 +173,16 @@ def trading_on():
 
 def save_settings(s):
     try:
-        cur = {}
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE) as f:
-                    cur = json.load(f)
-            except Exception:
-                cur = {}
-        cur.update(s)
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(cur, f)
+        with _STATE_LOCK:
+            cur = {}
+            if os.path.exists(SETTINGS_FILE):
+                try:
+                    with open(SETTINGS_FILE) as f:
+                        cur = json.load(f)
+                except Exception:
+                    cur = {}
+            cur.update(s)
+            _atomic_write(SETTINGS_FILE, json.dumps(cur))
     except Exception as e:
         print("Settings save failed:", e)
 
@@ -152,10 +190,12 @@ def save_settings(s):
 def _indicator_stack(closes, ohlc=None):
     """Precompute every series the decision needs.
 
-    When real OHLC is supplied, True Range / Wilder ATR / +DI / -DI / ADX and
-    the stochastic/Williams ranges use actual high/low (the same formulas as
-    backtrader's atr.py and directionalmove.py). Otherwise it falls back to a
-    close-only approximation.
+    Indicators (chart setup): Bollinger (20, 2) + (20, 3), Stochastic 6/3/3
+    (SMA-smoothed %K), CCI 25, ADX (smoothing 1, DI length 5).
+
+    When real OHLC is supplied, Bollinger bands, the Stochastic ranges, CCI's
+    typical price and +DI/-DI use actual high/low. Otherwise they fall back to
+    a close-only approximation (high = low = close).
     """
     s = pd.Series([float(x) for x in closes])
     n = len(s)
@@ -177,65 +217,117 @@ def _indicator_stack(closes, ohlc=None):
     rsi = 100.0 - (100.0 / (1.0 + gain / loss.replace(0, 1e-12)))
     mom3 = s - s.shift(3)
     sma = s.rolling(PERIOD).mean()
-    std = s.rolling(PERIOD).std()
+    std = s.rolling(PERIOD).std(ddof=0)   # TradingView uses population stdev
     width = (2.0 * STD_MULT) * std
     wpc = (width / sma * 100).rolling(50).rank(pct=True) * 100
 
-    # True Range + Wilder ATR (backtrader TrueRange / ATR)
+    # Bollinger 20/2 and 20/3 (the two sets in the chart setup)
+    lower2 = sma - STD_MULT * std
+    upper2 = sma + STD_MULT * std
+    lower3 = sma - STD_MULT_OUTER * std
+    upper3 = sma + STD_MULT_OUTER * std
+
+    # True Range + Wilder ATR (feeds +DI/-DI/ADX)
     prev_close = s.shift(1)
     tr = pd.concat([(high - low),
                     (high - prev_close).abs(),
                     (prev_close - low).abs()], axis=1).max(axis=1)
-    alpha = 1.0 / 14.0
-    atr = tr.ewm(alpha=alpha, adjust=False).mean()
-    # Directional Movement (backtrader DirectionalMove): +DI, -DI, ADX
+    # TradingView ADX inputs: "DI Length" smooths TR and +DM/-DM,
+    # "ADX Smoothing" smooths DX (period 1 -> raw DX, no smoothing)
+    alpha_di = 1.0 / ADX_DI_LEN
+    atr = tr.ewm(alpha=alpha_di, adjust=False).mean()
+    # Directional Movement (Wilder): +DI, -DI, ADX
     up = high.diff()
     dn = -low.diff()
     plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=s.index)
     minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=s.index)
     natr = atr.replace(0, 1e-12)
-    plus_di = 100.0 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / natr
-    minus_di = 100.0 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / natr
+    plus_di = 100.0 * plus_dm.ewm(alpha=alpha_di, adjust=False).mean() / natr
+    minus_di = 100.0 * minus_dm.ewm(alpha=alpha_di, adjust=False).mean() / natr
     dx = ((plus_di - minus_di).abs()
           / (plus_di + minus_di).replace(0, 1e-12)) * 100.0
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    alpha_adx = 1.0 / max(1, ADX_SMOOTHING)
+    adx = dx.ewm(alpha=alpha_adx, adjust=False).mean()
 
-    # Stochastic / Williams %R / pivots use the true 14-bar high-low range
-    low_14 = low.rolling(14).min()
-    high_14 = high.rolling(14).max()
-    rng14 = (high_14 - low_14).replace(0, 1e-12)
-    stoch_k = 100 * (s - low_14) / rng14
-    stoch_d = stoch_k.rolling(3).mean()
-    will_r = -100 * (high_14 - s) / rng14
-    pivot = (high_14 + low_14 + s) / 3
-    r1 = 2 * pivot - low_14
-    s1 = 2 * pivot - high_14
+    # Stochastic (%K period 6, %D period 3, %K smoothing 3 via SMA)
+    low_k = low.rolling(STOCH_K).min()
+    high_k = high.rolling(STOCH_K).max()
+    rng_k = (high_k - low_k).replace(0, 1e-12)
+    k_raw = 100.0 * (s - low_k) / rng_k
+    stoch_k = k_raw.rolling(STOCH_SMOOTH).mean()   # smoothed %K as displayed
+    stoch_d = stoch_k.rolling(STOCH_D).mean()
+
+    # CCI 25 (typical price uses real high/low when available)
+    tp = (high + low + s) / 3.0
+    tp_ma = tp.rolling(CCI_PERIOD).mean()
+    mad = tp.rolling(CCI_PERIOD).apply(
+        lambda x: float(np.mean(np.abs(x - x.mean()))), raw=True)
+    cci = (tp - tp_ma) / (0.015 * mad.replace(0, 1e-12))
+
     return {"s": s, "ema9": ema9, "ema21": ema21, "hist": hist, "rsi": rsi,
             "mom3": mom3, "wpc": wpc, "sma": sma, "std": std,
-            "adx": adx, "plus_di": plus_di, "minus_di": minus_di, "atr": atr,
-            "stoch_k": stoch_k, "stoch_d": stoch_d,
-            "will_r": will_r, "pivot": pivot, "r1": r1, "s1": s1}
+            "high": high, "low": low,
+            "lower2": lower2, "upper2": upper2,
+            "lower3": lower3, "upper3": upper3,
+            "stoch_k": stoch_k, "stoch_d": stoch_d, "cci": cci,
+            "adx": adx, "plus_di": plus_di, "minus_di": minus_di, "atr": atr}
 
 
 def _votes(stk, i, w):
-    """Weighted majority vote of predictors. Always CALL or PUT."""
-    e = 1 if float(stk["ema9"].iloc[i]) >= float(stk["ema21"].iloc[i]) else -1
-    m = 1 if float(stk["hist"].iloc[i]) >= 0 else -1
-    r = stk["rsi"].iloc[i]
-    r = 1 if (50.0 if pd.isna(r) else float(r)) >= 50 else -1
-    o = 1 if float(stk["mom3"].iloc[i]) >= 0 else -1
-    adx_val = float(stk["adx"].iloc[i]) if not pd.isna(stk["adx"].iloc[i]) else 0
-    w_adx = 1.0 if adx_val >= 20 else 0.5
-    stoch_k = float(stk["stoch_k"].iloc[i]) if not pd.isna(stk["stoch_k"].iloc[i]) else 50
-    w_stoch = 1.0 if 20 <= stoch_k <= 80 else 0.7
-    will_r = float(stk["will_r"].iloc[i]) if not pd.isna(stk["will_r"].iloc[i]) else -50
-    w_will = 1.0 if will_r < -20 else 0.8
-    sc = (w[0] * w_adx * e + w[1] * w_stoch * m + w[2] * w_will * r + w[3] * e) / 4.0
-    if sc > 0:
+    """Confluence reversal rule (the chart setup) - or None when no setup.
+
+    Measured as variant "D" (best sample/fidelity balance, see notes):
+      - the price TAGGED the lower Bollinger 20/2 band within the last 3 bars
+        (wick or close), and has NOT closed beyond the 20/3 band now;
+      - Stochastic %K(6/3) hooked: close zone K <= 30, K >= previous K
+        (up-hook), and %K touched <= 20 within the last 3 bars (extreme);
+      - CCI(25) <= -100 on this or the previous bar (extreme), with the
+        up-tick owned by the stochastic hook;
+      - ADX (smoothing 1, DI 5) < 25 - ranges only, never fade a runaway.
+    BUY fires at the hook bar, settling one bar later (HORIZON=1).
+    SELL (PUT): exact mirror at the upper bands.
+    """
+    _ = w  # confluence rule has no tunable vote weights
+    def val(key, off=0):
+        v = stk[key].iloc[i - off]
+        return None if pd.isna(v) else float(v)
+
+    c = val("s")
+    low2, up2 = val("lower2"), val("upper2")
+    low3, up3 = val("lower3"), val("upper3")
+    k_now, k_prev = val("stoch_k"), val("stoch_k", 1)
+    cci_now, cci_prev = val("cci"), val("cci", 1)
+    adx = val("adx")
+    low_w3 = [val("low", off) for off in (0, 1, 2)]
+    high_w3 = [val("high", off) for off in (0, 1, 2)]
+    if any(v is None for v in (c, low2, up2, low3, up3, k_now, k_prev,
+                               cci_now, cci_prev, adx)):
+        return None
+    if any(v is None for v in low_w3 + high_w3):
+        return None
+    k_min3 = min(val("stoch_k", off) for off in (0, 1, 2))
+    k_max3 = max(val("stoch_k", off) for off in (0, 1, 2))
+    if None in (k_min3, k_max3):
+        return None
+
+    # --- CALL: lower-band bounce with oversold confirmation ---
+    touch_low = min(low_w3) <= low2                 # tagged band recently
+    not_knife = c >= low3                           # no close beyond 20/3 now
+    stoch_call = (k_now <= 30.0 and k_now >= k_prev  # hooking up from below
+                  and k_min3 <= STOCH_OS)            # extreme seen recently
+    cci_call = cci_now <= CCI_OS or cci_prev <= CCI_OS
+    if touch_low and not_knife and stoch_call and cci_call and adx < ADX_TREND:
         return "CALL"
-    if sc < 0:
+
+    # --- PUT: upper-band fade with overbought confirmation ---
+    touch_up = max(high_w3) >= up2                  # tagged band recently
+    not_rocket = c <= up3                           # no close beyond 20/3 now
+    stoch_put = (k_now >= 70.0 and k_now <= k_prev  # hooking down from above
+                 and k_max3 >= STOCH_OB)            # extreme seen recently
+    cci_put = cci_now >= CCI_OB or cci_prev >= CCI_OB
+    if touch_up and not_rocket and stoch_put and cci_put and adx < ADX_TREND:
         return "PUT"
-    return "CALL" if e > 0 else "PUT"
+    return None
 
 
 def regime_at(stk, i):
@@ -251,10 +343,11 @@ def regime_at(stk, i):
 
 
 def decide_at(stk, i, params):
-    if i < PERIOD + RSI_PERIOD:
+    if i < WARMUP_BARS:
         return None
-    if pd.isna(stk["ema21"].iloc[i]) or pd.isna(stk["mom3"].iloc[i]):
-        return None
+    for key in ("stoch_k", "stoch_d", "cci", "adx", "lower2", "lower3"):
+        if pd.isna(stk[key].iloc[i]):
+            return None
     return _votes(stk, i, params["w"])
 
 
@@ -350,7 +443,7 @@ def _fold_edge(stk, params, folds=4):
     enough samples (so a decayed edge is caught), otherwise the whole sample.
     `accs` lists every fold's hit-rate for a stability check."""
     s = stk["s"]
-    start = PERIOD + RSI_PERIOD + 4
+    start = WARMUP_BARS + 1
     wins = []
     for i in range(start, len(s) - HORIZON):
         sig = decide_at(stk, i, params)
@@ -392,12 +485,19 @@ def _fold_edge(stk, params, folds=4):
             "fold_stats": fold_stats}
 
 
-def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=None):
+def analyze(closes, model=None, news_symbol=None, pair=None, period=None,
+            ohlc=None, z_mult=1.0):
+    """Evaluate the current bar for a tradeable setup.
+
+    `z_mult` widens the Wilson lower-bound to account for the fact that the
+    pair was picked as the best of ~N candidates (multiple-comparison /
+    winner's-curse correction when scanning many pairs)."""
     model = model or CURRENT_MODEL
     params = MODEL_PARAMS.get(model, MODEL_PARAMS["engine"])
     pair = pair or sel_pair_default()
     period = int(period or 60)
     out = {"signal": "WAIT", "note": "", "rsi": None,
+           "stoch": None, "cci": None, "adx": None,
            "up": None, "lo": None, "wide": False, "depth": 0.0, "model": model,
            "setup": False, "regime": "normal", "horizon": HORIZON,
            "full_acc": 0.0, "full_wins": 0, "full_total": 0, "fold_accs": [],
@@ -405,8 +505,8 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
            "confidence": 0.0, "tradeable": False, "payout": None,
            "break_even": None, "wilson": 0.0, "gate_note": "",
            "gate_reason": "", "validated": False, "validated_stats": None,
-           "report_age": None}
-    need = PERIOD + RSI_PERIOD + 6
+           "report_age": None, "z_mult": z_mult}
+    need = WARMUP_BARS + 1
     if not closes or len(closes) < need:
         out["note"] = "Not enough candle history for this timeframe. Pick a shorter time."
         return out
@@ -437,7 +537,7 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
         if out["payout"] is None and rep.get("payout"):
             out["payout"] = rep.get("payout")
     out["break_even"] = be
-    out["wilson"] = _wilson_lower(f_wins, f_total, WILSON_Z)
+    out["wilson"] = _wilson_lower(f_wins, f_total, WILSON_Z * z_mult)
 
     report_ok = False
     report_note = ""
@@ -522,6 +622,9 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
 
     i = len(s) - 1
     out["rsi"] = float(stk["rsi"].iloc[i]) if not pd.isna(stk["rsi"].iloc[i]) else None
+    out["stoch"] = float(stk["stoch_k"].iloc[i]) if not pd.isna(stk["stoch_k"].iloc[i]) else None
+    out["cci"] = float(stk["cci"].iloc[i]) if not pd.isna(stk["cci"].iloc[i]) else None
+    out["adx"] = float(stk["adx"].iloc[i]) if not pd.isna(stk["adx"].iloc[i]) else None
     sma, std = stk["sma"], stk["std"]
     up = sma + STD_MULT * std
     lo = sma - STD_MULT * std
@@ -529,13 +632,22 @@ def analyze(closes, model=None, news_symbol=None, pair=None, period=None, ohlc=N
     out["lo"] = float(lo.iloc[i]) if not pd.isna(lo.iloc[i]) else None
     out["regime"] = regime_at(stk, i)
     out["wide"] = out["regime"] in ("wide",)
-    out["setup"] = out["regime"] == "squeeze"
     out["note"] = ("Quiet market - the regime with the best measured edge."
-                   if out["setup"] else "Normal volatility - accuracy near a coin flip.")
+                   if out["regime"] == "squeeze"
+                   else "Normal volatility - accuracy near a coin flip.")
 
     out["confidence"] = out["full_acc"]
-    vote = decide_at(stk, i, params) or "WAIT"
-    out["signal"] = vote if out["tradeable"] else "NO TRADE"
+    vote = decide_at(stk, i, params)
+    out["setup"] = bool(vote)
+    out["signal"] = "NO TRADE"
+    if out["tradeable"]:
+        if vote:
+            out["signal"] = vote
+        else:
+            out["gate_note"] = (
+                (out["gate_note"] + " Edge is validated, but the BB 2/3 + "
+                 "Stoch + CCI confluence has no setup on the current bar.")
+                .strip())
     return out
 
 
@@ -566,19 +678,29 @@ def _ml_data_load():
 
 def _ml_data_save(d):
     try:
-        with open(ML_DATA_FILE, "w") as f:
-            json.dump(d, f)
+        with _STATE_LOCK:
+            _atomic_write(ML_DATA_FILE, json.dumps(d))
     except Exception as e:
         print("ML data save failed:", e)
 
 
 def _ml_save():
     try:
+        import io
         import pickle
-        with open(ML_MODEL_FILE, "wb") as f:
-            pickle.dump({"models": _ml_models, "meta": _ml_meta}, f)
+        buf = io.BytesIO()
+        pickle.dump({"models": _ml_models, "meta": _ml_meta}, buf)
+        with _STATE_LOCK:
+            _atomic_write_binary(ML_MODEL_FILE, buf.getvalue())
     except Exception as e:
         print("ML model save failed:", e)
+
+
+def _atomic_write_binary(path, data):
+    tmp = str(path) + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
 
 
 def _ml_load():
@@ -853,52 +975,55 @@ RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def results_load():
-    try:
-        with open(RESULTS_FILE) as f:
-            d = json.load(f)
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    with _STATE_LOCK:
+        try:
+            with open(RESULTS_FILE) as f:
+                d = json.load(f)
+            return d if isinstance(d, list) else []
+        except Exception:
+            return []
 
 
 def results_save(items):
-    try:
-        with open(RESULTS_FILE, "w") as f:
-            json.dump(items[-100:], f)
-    except Exception as e:
-        print("Results save failed:", e)
+    with _STATE_LOCK:
+        try:
+            _atomic_write(RESULTS_FILE, json.dumps(items[-100:]))
+        except Exception as e:
+            print("Results save failed:", e)
 
 
 def note_placed(chat, ticket, pair, direction, period, entry=None):
     """Remember an accepted order so its settlement can be announced."""
-    cutoff = time.time() - 86400
-    items = [p for p in results_load()
-             if float(p.get("placed_ts") or 0) >= cutoff]
-    items.append({
-        "chat": str(chat), "ticket": str(ticket or ""),
-        "pair": pair, "dir": direction, "period": int(period),
-        "entry": entry, "placed_ts": time.time(),
-    })
-    results_save(items)
+    with _STATE_LOCK:
+        cutoff = time.time() - 86400
+        items = [p for p in results_load()
+                 if float(p.get("placed_ts") or 0) >= cutoff]
+        items.append({
+            "chat": str(chat), "ticket": str(ticket or ""),
+            "pair": pair, "dir": direction, "period": int(period),
+            "entry": entry, "placed_ts": time.time(),
+        })
+        results_save(items)
 
 def track_load():
-    try:
-        with open(TRACK_FILE) as f:
-            d = json.load(f)
-        if isinstance(d, dict):
-            d.setdefault("pending", [])
-            d.setdefault("settled", [])
-            return d
-    except Exception:
-        pass
-    return {"pending": [], "settled": []}
+    with _STATE_LOCK:
+        try:
+            with open(TRACK_FILE) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                d.setdefault("pending", [])
+                d.setdefault("settled", [])
+                return d
+        except Exception:
+            pass
+        return {"pending": [], "settled": []}
 
 def track_save(d):
-    try:
-        with open(TRACK_FILE, "w") as f:
-            json.dump(d, f)
-    except Exception as e:
-        print("Track save failed:", e)
+    with _STATE_LOCK:
+        try:
+            _atomic_write(TRACK_FILE, json.dumps(d))
+        except Exception as e:
+            print("Track save failed:", e)
 
 def track_add(pair, tf, direction, entry, model, regime, features=None):
     tfi = max(1, int(tf))
@@ -915,16 +1040,17 @@ def track_add(pair, tf, direction, entry, model, regime, features=None):
         entry = float(entry)
     except Exception:
         return
-    d = track_load()
-    d["pending"].append({
-        "id": int(time.time() * 1000),
-        "pair": pair, "tf": tfi, "dir": direction,
-        "entry": entry, "model": model, "regime": regime,
-        "features": features,
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "expire_at": time.time() + HORIZON * tfi,
-    })
-    track_save(d)
+    with _STATE_LOCK:
+        d = track_load()
+        d["pending"].append({
+            "id": int(time.time() * 1000),
+            "pair": pair, "tf": tfi, "dir": direction,
+            "entry": entry, "model": model, "regime": regime,
+            "features": features,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "expire_at": time.time() + HORIZON * tfi,
+        })
+        track_save(d)
 
 def _settle_price(pair, tfi, expire_ts):
     """Close of the first CLOSED candle at/after the expiry moment.
@@ -967,45 +1093,46 @@ def _settle_price(pair, tfi, expire_ts):
         return None
 
 def track_settle():
-    d = track_load()
-    if not d["pending"]:
-        return
-    now = time.time()
-    still = []
-    changed = False
-    for p in d["pending"]:
-        if now < p.get("expire_at", 0) or now < float(p.get("check_at", 0)):
-            still.append(p)
-            continue
-        pair = p.get("pair", sel_pair_default())
-        tfi = int(p.get("tf", 60))
-        px = _settle_price(pair, tfi, float(p.get("expire_at", 0)))
-        if px is None:
-            p["check_at"] = now + 20
-            still.append(p)
-            continue
-        entry = float(p["entry"])
-        changed = True
-        if px == entry:
-            print(f"Settled {p['dir']} {pair} entry={entry} exit={px} -> REFUND (tie)")
-            continue
-        win = (px > entry) if p["dir"] == "CALL" else (px < entry)
-        d["settled"].append({
-            "pair": p["pair"], "tf": p["tf"], "dir": p["dir"],
-            "entry": entry, "exit": px, "win": bool(win),
-            "model": p.get("model"), "regime": p.get("regime"),
-            "closed": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        try:
-            _ml_learn(pair, p.get("features"), p.get("dir"), bool(win))
-        except Exception as e:
-            print("ML feedback skipped:", e)
-        print(f"Settled {p['dir']} {pair} entry={entry} exit={px} "
-              f"-> {'WIN' if win else 'LOSS'}")
-    d["settled"] = d["settled"][-200:]
-    d["pending"] = still
-    if changed:
-        track_save(d)
+    with _STATE_LOCK:
+        d = track_load()
+        if not d["pending"]:
+            return
+        now = time.time()
+        still = []
+        changed = False
+        for p in d["pending"]:
+            if now < p.get("expire_at", 0) or now < float(p.get("check_at", 0)):
+                still.append(p)
+                continue
+            pair = p.get("pair", sel_pair_default())
+            tfi = int(p.get("tf", 60))
+            px = _settle_price(pair, tfi, float(p.get("expire_at", 0)))
+            if px is None:
+                p["check_at"] = now + 20
+                still.append(p)
+                continue
+            entry = float(p["entry"])
+            changed = True
+            if px == entry:
+                print(f"Settled {p['dir']} {pair} entry={entry} exit={px} -> REFUND (tie)")
+                continue
+            win = (px > entry) if p["dir"] == "CALL" else (px < entry)
+            d["settled"].append({
+                "pair": p["pair"], "tf": p["tf"], "dir": p["dir"],
+                "entry": entry, "exit": px, "win": bool(win),
+                "model": p.get("model"), "regime": p.get("regime"),
+                "closed": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            try:
+                _ml_learn(pair, p.get("features"), p.get("dir"), bool(win))
+            except Exception as e:
+                print("ML feedback skipped:", e)
+            print(f"Settled {p['dir']} {pair} entry={entry} exit={px} "
+                  f"-> {'WIN' if win else 'LOSS'}")
+        d["settled"] = d["settled"][-200:]
+        d["pending"] = still
+        if changed:
+            track_save(d)
 
 def track_summary(last=30):
     st = track_load()["settled"][-last:]
@@ -1020,6 +1147,53 @@ def track_text():
     if not n:
         return "building (0 signals settled yet)"
     return f"{w}W / {l}L \u00b7 {pct:.0f}% (last {n})"
+
+
+# ===== daily risk stop (accepted orders honour it) =====
+RISK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "risk_state.json")
+
+
+def risk_state_load():
+    try:
+        with open(RISK_FILE) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {"date": time.strftime("%Y-%m-%d"), "profit": 0.0, "n": 0}
+
+
+def risk_state_save(d):
+    with _STATE_LOCK:
+        _atomic_write(RISK_FILE, json.dumps(d))
+
+
+def risk_reset_if_stale(d):
+    if d.get("date") != time.strftime("%Y-%m-%d"):
+        return {"date": time.strftime("%Y-%m-%d"), "profit": 0.0, "n": 0}
+    return d
+
+
+def risk_note_outcome(profit):
+    """Record one settled order's P/L against today's total."""
+    with _STATE_LOCK:
+        d = risk_reset_if_stale(risk_state_load())
+        d["profit"] = round(float(d.get("profit") or 0.0) + float(profit or 0.0), 4)
+        d["n"] = int(d.get("n") or 0) + 1
+        risk_state_save(d)
+        return d
+
+
+def risk_daily_block():
+    """True when today's realized loss or order count hits the daily cap."""
+    d = risk_reset_if_stale(risk_state_load())
+    if float(d.get("profit") or 0.0) <= -abs(DAILY_MAX_LOSS):
+        return True
+    if int(d.get("n") or 0) >= DAILY_MAX_TRADES:
+        return True
+    return False
 
 
 # ===== real account sync (linked via pocket_ssid.json, read-only) =====
@@ -1058,22 +1232,27 @@ def _acct_raw(asset, open_ts):
 
 
 def _feat_from_candles(raw, open_ts):
-    """16-feature snapshot at (or just after) a past timestamp, from real candles."""
+    """16-feature snapshot at (or just after) a past timestamp, from real candles.
+
+    Only candles that CLOSED strictly before `open_ts` are used - the candle
+    whose timestamp equals open_ts closes after the bet was placed, so
+    including it would leak the trade window into the training features."""
     try:
-        closes, cut = [], None
+        closes = []
         for row in raw:
+            try:
+                ts = int(row.get("time") or 0)
+            except Exception:
+                ts = 0
+            if ts and ts >= int(open_ts):
+                continue          # candle covering open_ts closes in the future
             try:
                 closes.append(float(row["close"]))
             except Exception:
                 continue
-            ts = int(row.get("time") or 0)
-            if cut is None and ts and ts >= open_ts:
-                cut = len(closes) - 1
-        if cut is None:
-            cut = len(closes) - 1
-        if cut < 70:
+        if len(closes) < 70:
             return None
-        return _feat_last(closes[:cut + 1])
+        return _feat_last(closes)
     except Exception:
         return None
 
@@ -1146,6 +1325,10 @@ def _notify_result(t):
          f"{match.get('dir')} {html.escape(fmt_pair(match.get('pair')))} \u00b7 "
          f"{tf_label(match.get('period'))}\nProfit: {profit:+.2f}{extra}",
          chat_id=match.get("chat"), html_on=True)
+    try:
+        risk_note_outcome(profit)
+    except Exception as e:
+        print("risk note failed:", e)
     print(f"[result] {match.get('pair')} {verdict} profit={profit:+.2f}")
 
 
@@ -1164,8 +1347,7 @@ def sync_account_trades():
     except Exception:
         return
     seen = set(str(x) for x in (d.get("seen_deals") or []))
-    track = track_load()
-    new_seen = []
+    acct_settled = []
     changed = False
     new_ts = {}
     for t in trades:
@@ -1199,7 +1381,7 @@ def sync_account_trades():
             direction = "PUT" if went_up else "CALL"
         feats = _feat_from_candles(raw_cache.get(t["asset"]) or [], t["open_ts"])
         _ml_learn(t["asset"], feats, direction, bool(t["win"]))
-        track["settled"].append({
+        acct_settled.append({
             "pair": t["asset"], "tf": t["tf"], "dir": direction,
             "entry": t["entry"], "exit": t["exit"], "win": bool(t["win"]),
             "model": None, "regime": "account", "source": "account",
@@ -1216,8 +1398,11 @@ def sync_account_trades():
             seen.update(new_seen)
             d["seen_deals"] = sorted(seen)[-500:]
             _ml_data_save(d)
-        track["settled"] = track["settled"][-200:]
-        track_save(track)
+        with _STATE_LOCK:
+            tr = track_load()
+            tr["settled"].extend(acct_settled)
+            tr["settled"] = tr["settled"][-200:]
+            track_save(tr)
 
 def sel_pair_default():
     return "EURUSD-OTC"
@@ -1228,7 +1413,9 @@ def market_report(pair, period_sec, fetch=True):
         return None
     ohlc = None
     try:
-        ohlc = pocket_payout.live_ohlcv(pair, period_sec) if fetch else None
+        # closed bars only - display may lag a second, decisions must not
+        ohlc = (pocket_payout.live_ohlcv(pair, period_sec, include_forming=False)
+                if fetch else None)
         if not ohlc:
             ohlc = (pocket_payout.get_ohlcv(pair, period_sec, 220) if fetch
                     else pocket_payout.peek_ohlcv(pair, period_sec))
@@ -1356,7 +1543,10 @@ def get_series(pair, period_sec, fetch=True, count=220):
     global DATA_SRC
     if pocket_payout is not None:
         try:
-            closes = (pocket_payout.live_closes(pair, period_sec)
+            # closed bars only for signal evaluation - the forming candle is
+            # still changing and must never drive a decision
+            closes = (pocket_payout.live_closes(pair, period_sec,
+                                                include_forming=False)
                       if fetch and count <= 220 else None)
             if closes and len(closes) >= PERIOD + RSI_PERIOD + 5:
                 DATA_SRC = "live stream"
@@ -1397,7 +1587,7 @@ def fetch_ohlc(pair, period_sec, count=220, ttl=None):
     if pocket_payout is None:
         return None
     try:
-        ohlc = (pocket_payout.live_ohlcv(pair, period_sec)
+        ohlc = (pocket_payout.live_ohlcv(pair, period_sec, include_forming=False)
                 if count <= 220 else None)
         if not ohlc:
             extra = {} if ttl is None else {"ttl": ttl}
@@ -1653,59 +1843,58 @@ def sparkline(vals):
     return "".join(blocks[min(7, int((v - lo) / rng * 7.999))] for v in vals)
 
 def tech_metrics(closes, ohlc, res):
-    out = {"vol": "Normal", "vol_pct": 50.0, "rsi_label": "Neutral", "macd": "Neutral",
-           "ma": "Sideways", "sentiment": "Sideways pressure", "price": None,
-           "conditions": "Favorable"}
-    if not closes or len(closes) < 30:
+    """Card readouts from the SAME stack the engine decides with:
+    Bollinger position/volatility, Stochastic, CCI, ADX."""
+    out = {"vol": "Normal", "vol_pct": 50.0, "rsi_label": "Neutral",
+           "macd": "Neutral", "ma": "Ranging", "sentiment": "Sideways pressure",
+           "price": None, "conditions": "Neutral"}
+    if not closes or len(closes) < WARMUP_BARS:
         return out
-    s = pd.Series([float(x) for x in closes])
-    i = len(s) - 1
+    stk = _indicator_stack([float(x) for x in closes], ohlc)
+    i = len(stk["s"]) - 1
 
-    sma = s.rolling(PERIOD).mean()
-    std = s.rolling(PERIOD).std()
-    up = sma + STD_MULT * std
-    lo = sma - STD_MULT * std
-    width = up - lo
-    hist = width.iloc[max(0, i - 100):i + 1].dropna()
-    if len(hist) and not pd.isna(width.iloc[i]):
-        out["vol_pct"] = float((hist < width.iloc[i]).mean() * 100)
-    out["vol"] = ("High" if out["vol_pct"] >= 75 else
-                  "Increased" if out["vol_pct"] >= 50 else
-                  "Normal" if out["vol_pct"] >= 25 else "Low")
+    def fval(key):
+        v = stk[key].iloc[i]
+        return None if pd.isna(v) else float(v)
 
-    r = res.get("rsi")
-    if r is not None:
-        out["rsi_label"] = ("Oversold" if r <= 30 else "Low" if r < 40 else
-                            "Neutral" if r < 60 else "High" if r < 70 else "Overbought")
+    price = fval("s")
+    c_now, lo_now = fval("lower2"), fval("upper2")
+    width = c_now and lo_now and (lo_now - c_now)
+    hist = (stk["upper2"] - stk["lower2"]).iloc[max(0, i - 100):i + 1].dropna()
+    if width and len(hist):
+        out["vol_pct"] = float((hist < float(hist.iloc[-1])).mean() * 100)
+        out["vol"] = ("High" if out["vol_pct"] >= 75 else
+                      "Increased" if out["vol_pct"] >= 50 else
+                      "Normal" if out["vol_pct"] >= 25 else "Low")
 
-    ema12 = s.ewm(span=12, adjust=False).mean()
-    ema26 = s.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    sigl = macd.ewm(span=9, adjust=False).mean()
-    histm = macd - sigl
-    h_now, h_prev = float(histm.iloc[i]), float(histm.iloc[i - 1])
-    if h_prev <= 0 < h_now:
-        out["macd"] = "Bullish crossover"
-    elif h_prev >= 0 > h_now:
-        out["macd"] = "Bearish crossover"
-    elif h_now > 0:
-        out["macd"] = "Buying pressure"
-    elif h_now < 0:
-        out["macd"] = "Selling pressure"
+    k = fval("stoch_k")
+    d = fval("stoch_d")
+    if k is not None:
+        zone = ("Oversold" if k <= STOCH_OS else
+                "Overbought" if k >= STOCH_OB else "Neutral")
+        dd = f"/D {d:.0f}" if d is not None else ""
+        out["rsi_label"] = f"{zone} (K {k:.0f}{dd})"
 
-    ema9 = s.ewm(span=9, adjust=False).mean()
-    ema21 = s.ewm(span=21, adjust=False).mean()
-    slope = (float(ema21.iloc[i]) - float(ema21.iloc[max(0, i - 5)])) / max(abs(float(ema21.iloc[i])), 1e-12) * 100
-    out["ma"] = ("Upward trend" if slope > 0.01 else
-                 "Downward trend" if slope < -0.01 else "Sideways")
-    if float(ema9.iloc[i]) > float(ema21.iloc[i]):
-        out["sentiment"] = "Upward pressure"
-    elif float(ema9.iloc[i]) < float(ema21.iloc[i]):
-        out["sentiment"] = "Downward pressure"
+    cci = fval("cci")
+    if cci is not None:
+        lbl = ("Oversold" if cci <= CCI_OS else
+               "Overbought" if cci >= CCI_OB else "Neutral")
+        out["macd"] = f"{lbl} ({cci:+.0f})"
 
-    out["price"] = float(s.iloc[i])
+    adx = fval("adx")
+    if adx is not None:
+        out["ma"] = (f"ADX {adx:.0f} - "
+                     + ("ranging (rebounds favoured)" if adx < 20 else
+                        "trending (no fades)" if adx >= ADX_TREND else
+                        "trend building"))
 
-    out["conditions"] = ("Optimal" if (res.get("wide") and out["vol_pct"] >= 60) else
+    e9, e21 = fval("ema9"), fval("ema21")
+    if e9 is not None and e21 is not None:
+        out["sentiment"] = ("Upward pressure" if e9 > e21 else
+                            "Downward pressure" if e9 < e21 else "Sideways pressure")
+
+    out["price"] = price
+    out["conditions"] = ("Optimal" if res.get("setup") else
                          "Favorable" if out["vol_pct"] >= 30 else "Neutral")
     return out
 
@@ -1745,9 +1934,9 @@ def card_caption(res, m, conf, pair, tf_txt):
         f"\u2022 Sentiment: <b>{m['sentiment']}</b>\n\n"
         f"\U0001f9ed Technical overview:\n"
         f"\u2022 Current price: <b>{price(m['price'])} {mkt}</b>\n"
-        f"\u2022 RSI: <b>{m['rsi_label']}</b>\n"
-        f"\u2022 MACD: <b>{m['macd']}</b>\n"
-        f"\u2022 Moving Average: <b>{m['ma']}</b>\n\n"
+        f"\u2022 Stochastic: <b>{m['rsi_label']}</b>\n"
+        f"\u2022 CCI: <b>{m['macd']}</b>\n"
+        f"\u2022 ADX: <b>{m['ma']}</b>\n\n"
         f"\U0001f4e6 Signal edge:\n"
         f"\u2022 Edge: <b>{res.get('full_acc', 0):.0f}%</b> vs break-even "
         f"<b>{(res.get('break_even') or 0):.0f}%</b> "
@@ -1827,6 +2016,10 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
         pairs = market_pairs(market)
     except Exception:
         pairs = []
+    # multiple-comparison correction: this pair beat ~N others, so its
+    # measured edge must clear a wider Wilson floor before we trust it
+    n_cand = max(1, len(pairs))
+    z_mult = min(2.5, math.sqrt(2.0 * math.log(max(2, n_cand))))
 
     def _one(pair, pay):
         if pay and pay < MIN_PAYOUT:
@@ -1840,7 +2033,8 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
                 if note or not closes:
                     return None
                 ohlc = None
-            res = analyze(closes, pair=pair, period=period_sec, ohlc=ohlc)
+            res = analyze(closes, pair=pair, period=period_sec, ohlc=ohlc,
+                          z_mult=z_mult)
             be = res.get("break_even")
             edge = res.get("full_acc", 0.0)
             return {
@@ -1922,7 +2116,8 @@ def scan_pairs(period_sec, market="otc", max_pairs=30):
                 print(f"[deep] {pair}: got {len(closes)} <= broad {broad_n} "
                       "bars, keeping broad")
                 return r
-            res = analyze(closes, pair=pair, period=per, ohlc=ohlc)
+            res = analyze(closes, pair=pair, period=per, ohlc=ohlc,
+                          z_mult=z_mult)
         except Exception as e:
             mark(0, broad_n)
             print(f"[deep] {pair}: failed ({e})")
@@ -2047,8 +2242,7 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
     remember_signal(mid, res, pair, sel_time, m.get("price"))
     return mid
 
-GEN_STEPS = ["Volatility scan", "RSI Analysis", "MACD Status", "Moving Average",
-             "Signal Accuracy"]
+GEN_STEPS = ["Volatility scan", "Stochastic", "CCI", "ADX Trend", "Signal Accuracy"]
 GEN_PCT = [15, 35, 55, 75, 100]
 
 def gen_text(pct, values):
@@ -2070,11 +2264,17 @@ HELP_TEXT = (
     "/gate strict|point - Strict Wilson floor vs point-edge mode\n"
     "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
+    "Strategy engine: Bollinger 20/2 + 20/3, Stochastic 6/3 (SMA smooth 3), "
+    "CCI 25, ADX (smoothing 1, DI 5) - band-tag reversal setups only while "
+    "ADX < 25, gated by the "
+    "setup's measured out-of-sample hit-rate vs payout break-even.\n"
     "Flow: Start -> market (Stock/OTC/Both) -> pair -> time -> signal\n"
     "Tap Find a trade to scan all pairs and get pinged only when one clears "
     "break-even.\n"
     "Accept signal places a real order only when trading is enabled with "
     "/trading on (and your SSID is saved). Otherwise it is display-only.\n"
+    "Daily risk stop: Accept pauses after the configured realized loss "
+    "or order count for the day.\n"
     "Accepted orders send a WIN/LOSS/REFUND message with profit and balance "
     "once the account deal settles."
 )
@@ -2120,8 +2320,19 @@ if __name__ == "__main__":
     MIN_BACKTEST_N = max(100, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     TRADE_AMOUNT = max(0.01, float(S.get("trade_amount", TRADE_AMOUNT)))
+    DAILY_MAX_LOSS = max(1.0, float(S.get("daily_max_loss", DAILY_MAX_LOSS)))
+    DAILY_MAX_TRADES = max(1, int(S.get("daily_max_trades", DAILY_MAX_TRADES)))
+    MAX_STAKE_BALANCE_PCT = max(0.5,
+                                float(S.get("max_stake_pct",
+                                            MAX_STAKE_BALANCE_PCT)))
+    print(f"Risk: Accept stops after {DAILY_MAX_LOSS:g} units realized loss "
+          f"or {DAILY_MAX_TRADES} orders today; stake <= "
+          f"{MAX_STAKE_BALANCE_PCT:.0f}% of balance.")
     update_offset = None
-    owner_id = None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)
+    # fixed owner: explicit env id wins, else the TELEGRAM_CHAT_ID, else
+    # whoever sends /start first (last resort, as before)
+    owner_id = (str(os.getenv("TELEGRAM_OWNER_ID") or "").strip()
+                or (None if str(CHAT_ID).startswith("PASTE") else str(CHAT_ID)))
     last_state = {}
     auto_tick = 0.0
     acct_tick = 0.0
@@ -2227,9 +2438,13 @@ if __name__ == "__main__":
             period = int(sel_time)
         if ts:
             age = time.time() - int(ts)
-            if age > max(120, period * 2):
+            # stale signal = the setup bar is long gone; allow only a small
+            # fraction of the expiry as acceptance delay
+            limit = max(10, min(60, int(period) // 2))
+            if age > limit:
                 send(f"\u231b <b>Signal expired</b> \u2014 it is {int(age)}s old, "
-                     f"past the {tf_label(period)} expiry. Ask for a fresh one.",
+                     f"past the {limit}s window for a "
+                     f"{tf_label(period)} setup. Ask for a fresh one.",
                      chat_id=chat, html_on=True)
                 return
         if pocket_payout is None:
@@ -2242,7 +2457,23 @@ if __name__ == "__main__":
                  f"{signal} {html.escape(fmt_pair(pair))} \u00b7 "
                  f"{tf_label(period)}", chat_id=chat, html_on=True)
             return
+        if risk_daily_block():
+            send("\U0001f6d1 <b>Daily risk stop reached</b> \u2014 today's "
+                 "realized loss limit or order cap is hit. No more orders "
+                 "until tomorrow. Send /status to review.", chat_id=chat,
+                 html_on=True)
+            return
         amount = TRADE_AMOUNT
+        bal0 = None
+        try:
+            bal0 = pocket_payout.account_balance()
+        except Exception:
+            bal0 = None
+        if bal0 is not None and amount > bal0 * MAX_STAKE_BALANCE_PCT / 100.0:
+            send(f"\u26a0 <b>Stake too large</b>: {amount:g} is more than "
+                 f"{MAX_STAKE_BALANCE_PCT:.0f}% of balance {bal0:.2f}. "
+                 f"Use /amount to lower it.", chat_id=chat, html_on=True)
+            return
         ok, msg = pocket_payout.place_trade(pair, signal, amount, period)
         if ok:
             try:
@@ -2338,6 +2569,9 @@ if __name__ == "__main__":
                        "model": sel_model, "market": sel_market,
                        "edge_margin": EDGE_MARGIN, "min_backtest_n": MIN_BACKTEST_N,
                        "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT,
+                       "daily_max_loss": DAILY_MAX_LOSS,
+                       "daily_max_trades": DAILY_MAX_TRADES,
+                       "max_stake_pct": MAX_STAKE_BALANCE_PCT,
                        "allow_trading": trading_on(), "gate_mode": GATE_MODE})
 
     def send_menu(chat):
@@ -2426,8 +2660,7 @@ if __name__ == "__main__":
         params = MODEL_PARAMS[sel_model]
         reveal_vals = [
             f"{m['vol']} \u26a1",
-            (f"{m['rsi_label']} ({res['rsi']:.1f})" if res.get("rsi") is not None
-             else m["rsi_label"]),
+            m["rsi_label"],
             m["macd"],
             m["ma"],
             f"{res.get('full_acc', 0):.0f}% ({res.get('full_total', 0)} past signals)",
