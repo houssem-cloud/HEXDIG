@@ -139,14 +139,15 @@ def _ensure_client():
     _reset_client()
     try:
         from BinaryOptionsToolsV2 import PocketOption
-    except Exception:
+    except Exception as e:
+        print(f"[pocket] library missing ({e}) - live features disabled")
         return None
     try:
         api = PocketOption(ssid)
         try:
             api.connect()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[pocket] connect() warning: {e}")
         try:
             api.wait_for_assets(timeout=30)
         except Exception:
@@ -161,8 +162,10 @@ def _ensure_client():
                 if sym:
                     m[_norm(sym)] = sym
             _CLIENT["map"] = m
-        except Exception:
-            pass
+            print(f"[pocket] connected - {len(m)} assets mapped"
+                  + ("" if m else " (asset list empty - SSID may be stale)"))
+        except Exception as e:
+            print(f"[pocket] asset list failed: {e} - SSID may be expired")
         return api
     except Exception:
         return None

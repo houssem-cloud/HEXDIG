@@ -118,8 +118,8 @@ MODEL_PARAMS = {
 MODELS = ["engine"]
 MODEL_NAMES = {"engine": "Engine"}
 
-TIMES = [(5, "5 seconds"), (15, "15 seconds"), (30, "30 seconds"), (60, "1 minutes"),
-         (120, "2 minutes"), (180, "3 minutes"), (300, "5 minutes"), (600, "10 minutes")]
+TIMES = [(60, "1 min"), (180, "3 min"), (300, "5 min"),
+         (1800, "30 min"), (3600, "1 hour"), (14400, "4 hours")]
 
 try:
     import pocket_payout
@@ -129,11 +129,18 @@ except Exception:
 DATA_SRC = "demo (random)"
 CURRENT_MODEL = "engine"
 
-DEFAULT_PAIRS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD",
-                 "EURGBP", "EURJPY", "GBPJPY", "EURAUD", "EURCHF", "EURCAD", "GBPCHF",
-                 "GBPCAD", "GBPAUD", "AUDCAD", "AUDCHF", "AUDJPY", "AUDNZD", "NZDCAD",
-                 "NZDCHF", "NZDJPY", "CADCHF", "CADJPY", "CHFJPY", "EURNZD", "USDSGD",
-                 "USDHKD", "USDCNH"]
+# Fallback when the live asset catalog is unavailable: every currency in BOTH
+# flavors so the OTC tab is never empty after a cold start (the -OTC names
+# resolve normally once the API connects and the catalog refreshes).
+_DEFAULT_CURRENCIES = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
+                       "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "EURAUD", "EURCHF",
+                       "EURCAD", "GBPCHF", "GBPCAD", "GBPAUD", "AUDCAD", "AUDCHF",
+                       "AUDJPY", "AUDNZD", "NZDCAD", "NZDCHF", "NZDJPY", "CADCHF",
+                       "CADJPY", "CHFJPY", "EURNZD", "USDSGD", "USDHKD", "USDCNH"]
+DEFAULT_PAIRS = []
+for _c in _DEFAULT_CURRENCIES:
+    DEFAULT_PAIRS.append(_c)
+    DEFAULT_PAIRS.append(_c + "-OTC")
 
 # ===== concurrent-safe state files =====
 # Several threads (settler, account sync, Telegram loop) load-modify-save the
@@ -1686,9 +1693,9 @@ def header_image(pair, signal, closes):
             d.line(pts, fill=dim, width=6, joint="curve")
             d.line(pts[-max(2, n // 3):], fill=color, width=6, joint="curve")
         d.text((24, 14), fmt_pair(pair), fill=(150, 160, 170), font=_load_font(30))
-        word = "BUY" if buy else "SELL"
-        d.text((24, 52), word, fill=color, font=_load_font(160))
-        d.text((40 + _load_font(160).getlength(word), 70),
+        word = "HIGHER" if buy else "LOWER"
+        d.text((24, 60), word, fill=color, font=_load_font(120))
+        d.text((24 + _load_font(120).getlength(word) + 8, 66),
                "\u25b2" if buy else "\u25bc", fill=color, font=_load_font(80))
         path = os.path.join(_IMG_DIR, f"hdr_{int(time.time() * 1000)}.png")
         img.save(path)
@@ -1790,7 +1797,7 @@ def tf_label(sec):
     for s, lab in TIMES:
         if s == sec:
             return lab
-    return "1 minutes"
+    return "1 min"
 
 def now_hm():
     return time.strftime("%I:%M %p").lstrip("0")
@@ -1823,9 +1830,8 @@ def kb_pairs(page, pairs, per=8):
     return rows
 
 def kb_times():
-    rows = [[{"text": lab, "callback_data": f"tm:{sec}"} for sec, lab in TIMES[i:i + 3]]
-            for i in range(0, 6, 3)]
-    rows.append([{"text": lab, "callback_data": f"tm:{sec}"} for sec, lab in TIMES[6:]])
+    rows = [[{"text": lab, "callback_data": f"tm:{sec}"} for sec, lab in TIMES[i:i + 2]]
+            for i in range(0, 6, 2)]
     rows.append([{"text": "Back", "callback_data": "ui:pairback"}])
     return rows
 
@@ -1837,14 +1843,19 @@ def kb_signal_ctx(pair, signal, period_sec, ts=None):
     if len(cb.encode("utf-8")) > 64:
         cb = f"acc:{pair}:{signal}:{int(period_sec)}"
     return [[{"text": "\u2705 Accept signal", "callback_data": cb}],
-            [{"text": "\U0001f504 Another signal", "callback_data": "sig:again"}],
-            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+            [{"text": "New signal", "callback_data": "sig:again"}],
+            [{"text": "Exit to Menu", "callback_data": "ui:menu"}]]
 
 
 def kb_signal():
     """Navigation-only keyboard for cards that carry no actionable signal."""
-    return [[{"text": "\U0001f504 Another signal", "callback_data": "sig:again"}],
-            [{"text": "Back to Menu", "callback_data": "ui:menu"}]]
+    return [[{"text": "New signal", "callback_data": "sig:again"}],
+            [{"text": "Exit to Menu", "callback_data": "ui:menu"}]]
+
+
+def kb_get_signal():
+    return [[{"text": "Get a signal", "callback_data": "sig:get"}],
+            [{"text": "Exit to Menu", "callback_data": "ui:menu"}]]
 
 # ===== signal card =====
 def sparkline(vals):
@@ -1855,12 +1866,46 @@ def sparkline(vals):
     rng = (hi - lo) or 1e-12
     return "".join(blocks[min(7, int((v - lo) / rng * 7.999))] for v in vals)
 
+def candle_pattern(ohlc):
+    """Name of the most recent notable candlestick pattern on the last closed
+    bar (bullish/bearish engulfing, hammer, shooting star, doji).
+
+    Informational context only - displayed on the card, NOT an entry condition.
+    The entry rule remains the band-tag + Stochastic hook + CCI + ADX setup."""
+    try:
+        rows = [r for r in (ohlc or []) if r and r.get("l") is not None]
+        if len(rows) < 3:
+            return None
+        r1, r0 = rows[-2], rows[-1]          # previous, latest closed bar
+        o0, c0 = float(r0["o"]), float(r0["c"])
+        o1, c1 = float(r1["o"]), float(r1["c"])
+        h0, l0 = float(r0["h"]), float(r0["l"])
+        body0 = abs(c0 - o0)
+        rng0 = (h0 - l0) or 1e-12
+        upper = h0 - max(o0, c0)
+        lower = min(o0, c0) - l0
+        body1 = abs(c1 - o1)
+        up0, up1 = c0 >= o0, c1 >= o1
+        if (not up1) and up0 and c0 >= o1 and o0 <= c1:
+            return "Bullish engulfing"
+        if up1 and (not up0) and c0 <= o1 and o0 >= c1:
+            return "Bearish engulfing"
+        if body0 and lower >= 2.0 * body0 and upper <= 0.3 * lower:
+            return "Hammer"
+        if body0 and upper >= 2.0 * body0 and lower <= 0.3 * upper:
+            return "Shooting star"
+        if body0 / rng0 <= 0.1:
+            return "Doji"
+        return None
+    except Exception:
+        return None
+
 def tech_metrics(closes, ohlc, res):
     """Card readouts from the SAME stack the engine decides with:
     Bollinger position/volatility, Stochastic, CCI, ADX."""
     out = {"vol": "Normal", "vol_pct": 50.0, "rsi_label": "Neutral",
            "macd": "Neutral", "ma": "Ranging", "sentiment": "Sideways pressure",
-           "price": None, "conditions": "Neutral"}
+           "price": None, "conditions": "Neutral", "pattern": None}
     if not closes or len(closes) < WARMUP_BARS:
         return out
     # Single source of truth: whatever OHLC was passed in, its own closes are
@@ -1914,6 +1959,7 @@ def tech_metrics(closes, ohlc, res):
                             "Downward pressure" if e9 < e21 else "Sideways pressure")
 
     out["price"] = price
+    out["pattern"] = candle_pattern(ohlc)
     out["conditions"] = ("Optimal" if res.get("setup") else
                          "Favorable" if out["vol_pct"] >= 30 else "Neutral")
     return out
@@ -1947,13 +1993,26 @@ def card_caption(res, m, conf, pair, tf_txt):
         win_lines.append(f"\U0001f4c8 Signals: <b>{w}W / {ln - w}L</b> "
                          f"(<b>{lpct:.0f}%</b> \u00b7 last {ln})")
     win_line = ("\n".join(win_lines) + "\n\n") if win_lines else ""
+    # competitor-style result header, honest accuracy underneath
+    n_setups = res.get("full_total", 0) or 0
+    acc = res.get("full_acc", 0.0)
+    hard = (" (small sample)" if n_setups < MIN_BACKTEST_N and n_setups > 0
+            else "")
+    pat_line = (f"\u2022 Candlesticks: <b>{html.escape(m['pattern'])}</b>\n"
+                if m.get("pattern") else "")
     return (
-        f"<b>{html.escape(fmt_pair(pair))}</b> | {tf_txt} | {word} {arrow}\n\n"
+        f"\U0001f534 {html.escape(fmt_pair(pair))} ({tf_txt}) - "
+        f"<b>{word}</b> {arrow}\n"
+        f"\U0001f3af Accuracy: <b>{acc:.0f}%</b>"
+        + (f" <i>over {n_setups} setups{hard}</i>" if n_setups else " <i>n/a</i>")
+        + "\n"
+        f"\u26a0\ufe0f Use this signal immediately for best results.\n\n"
         f"\U0001fab6 Market info:\n"
         f"\u2022 Volatility: <b>{m['vol']}</b>\n"
         f"\u2022 Sentiment: <b>{m['sentiment']}</b>\n\n"
         f"\U0001f9ed Technical overview:\n"
         f"\u2022 Current price: <b>{price(m['price'])} {mkt}</b>\n"
+        f"{pat_line}"
         f"\u2022 Stochastic: <b>{m['rsi_label']}</b>\n"
         f"\u2022 CCI: <b>{m['macd']}</b>\n"
         f"\u2022 ADX: <b>{m['ma']}</b>\n\n"
@@ -2014,9 +2073,9 @@ def no_trade_text(res, m, pair, tf_txt):
     else:
         edge_txt = "<b>n/a</b> (not enough history yet)"
     lines = [
-        f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(fmt_pair(pair))} | {tf_txt}",
+        f"\u270b <b>NO SIGNAL</b> \u2014 {html.escape(fmt_pair(pair))} | {tf_txt}",
         "",
-        "This setup does not clear the break-even bar, so no BUY/SELL is issued.",
+        intro,
         "",
         f"\u2022 {src}: {edge_txt}",
         f"\u2022 Break-even needed: <b>{be:.0f}%</b>" if be
@@ -2268,7 +2327,8 @@ def send_card(chat, res, m, conf, closes, pair=None, tf_txt=None):
             return mid
     buy = res["signal"] == "CALL"
     dot = "\U0001f7e2" if buy else "\U0001f534"
-    mid = send(f"{dot} <b>{'BUY' if buy else 'SELL'}</b> - "
+    word2 = "Higher" if buy else "Lower"
+    mid = send(f"{dot} <b>{word2}</b> \u2014 {'BUY' if buy else 'SELL'} · "
                f"{html.escape(fmt_pair(pair))} | {tf_txt}\n\n{cap}",
                chat_id=chat,
                keyboard=kb_signal_ctx(pair, res["signal"], sel_time), html_on=True)
@@ -2281,7 +2341,8 @@ GEN_PCT = [15, 35, 55, 75, 100]
 def gen_text(pct, values):
     filled = max(0, min(5, (pct + 19) // 20))
     bar = "\u25a0" * filled + "\u25a1" * (5 - filled)
-    lines = [f"Signal Generation...\n[{bar}] {pct}%", ""]
+    lines = [f"\U0001f50e Analyzing... {pct}%", "Analyzing the market \u2026", "",
+             f"[{bar}]", ""]
     for idx, name in enumerate(GEN_STEPS):
         v = values[idx] if idx < len(values) else "\u2026"
         prefix = "\u2514\u2500" if idx == len(GEN_STEPS) - 1 else "\u251c\u2500"
@@ -2296,11 +2357,14 @@ HELP_TEXT = (
     "/gate strict|point - Strict Wilson floor vs point-edge mode\n"
     "/status - Is the bot alive, last scan result, feed, balance\n"
     "/stop - Stop all signals\n"
-    "Strategy engine: Bollinger 20/2 + 20/3, Stochastic 6/3 (SMA smooth 3), "
+    "The bot combines candlestick-pattern recognition, volatility awareness, "
+    "short-term trend detection, and indicator-based logic to react to "
+    "real-time price movement.\n"
+    "Strategy core: Bollinger 20/2 + 20/3, Stochastic 6/3 (SMA smooth 3), "
     "CCI 25, ADX (smoothing 1, DI 5) - band-tag reversal setups only while "
     "ADX < 25, gated by the "
     "setup's measured out-of-sample hit-rate vs payout break-even.\n"
-    "Flow: Start -> market (Stock/OTC) -> pair -> time -> signal\n"
+    "Flow: Start -> market (Stock/OTC) -> pair -> time -> Get a signal\n"
     "BUY/SELL cards are shown only when the setup's measured accuracy is at "
     "least 60% (and clears break-even + margin over enough history).\n"
     "Accept signal places a real order only when trading is enabled with "
@@ -2349,7 +2413,9 @@ if __name__ == "__main__":
                       if GATE_MODE == "strict" else "point (+margin)"))
     EDGE_MARGIN = float(S.get("edge_margin", EDGE_MARGIN))
     MIN_ACCURACY = float(S.get("min_accuracy", MIN_ACCURACY))
-    MIN_BACKTEST_N = max(30, int(S.get("min_backtest_n", MIN_BACKTEST_N)))
+    # settings key is "min_bets"; legacy "min_backtest_n" persisted by older
+    # builds (e.g. 100) is ignored so the new default takes effect
+    MIN_BACKTEST_N = max(30, min(100, int(S.get("min_bets", MIN_BACKTEST_N))))
     MIN_PAYOUT = float(S.get("min_payout", MIN_PAYOUT))
     TRADE_AMOUNT = max(0.01, float(S.get("trade_amount", TRADE_AMOUNT)))
     DAILY_MAX_LOSS = max(1.0, float(S.get("daily_max_loss", DAILY_MAX_LOSS)))
@@ -2538,7 +2604,7 @@ if __name__ == "__main__":
         save_settings({"last_pair": sel_pair, "last_time": sel_time, "auto": False,
                        "model": sel_model, "market": sel_market,
                        "edge_margin": EDGE_MARGIN, "min_accuracy": MIN_ACCURACY,
-                       "min_backtest_n": MIN_BACKTEST_N,
+                       "min_bets": MIN_BACKTEST_N,
                        "min_payout": MIN_PAYOUT, "trade_amount": TRADE_AMOUNT,
                        "daily_max_loss": DAILY_MAX_LOSS,
                        "daily_max_trades": DAILY_MAX_TRADES,
@@ -2560,9 +2626,15 @@ if __name__ == "__main__":
 
     def send_pair_screen(chat, page=0, edit_mid=None):
         pairs = market_pairs(sel_market)
-        text = f"{screen_head('Pair', 2)}\nSelect a currency pair:  <i>{now_hm()}</i>"
+        note = ("If the stock market is closed at this time, the list will "
+                "consist exclusively of OTC pairs.")
+        text = (f"\U0001f3d7 <b>Pair</b>\n"
+                f"\u2022 Select the currency pair that you plan to trade.\n"
+                f"\u2022 {note}\n"
+                f"  <i>{now_hm()}</i>")
         if not pairs:
-            text = f"{screen_head('Pair', 2)}\nNo {market_label(sel_market)} currency pairs are online right now. Try another market."
+            text = (f"\U0001f3d7 <b>Pair</b>\nNo {market_label(sel_market)} "
+                    "currency pairs are online right now. Try another market.")
             keyboard = kb_market()
         else:
             pages = max(1, (len(pairs) + 7) // 8)
@@ -2577,12 +2649,28 @@ if __name__ == "__main__":
             send(text, chat_id=chat, keyboard=keyboard, html_on=True)
 
     def send_time_screen(chat, edit_mid=None):
-        text = f"{screen_head('Time', 3)}\nSelect trading time for {html.escape(fmt_pair(sel_pair))}:"
+        text = (f"\u23f0 <b>Select Time</b>\n\n"
+                "\U0001f53d Select the time\n"
+                f"Selected pair: <b>{html.escape(fmt_pair(sel_pair))}</b>\n"
+                f"Bot recommendation: <b>{tf_label(60)}</b>\n"
+                "Choose how long you want your signal to last:")
         if edit_mid:
             edit(text, chat, edit_mid, html_on=True)
             api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_times()}})
         else:
             send(text, chat_id=chat, keyboard=kb_times(), html_on=True)
+
+    def send_signal_ready_screen(chat, edit_mid=None):
+        text = (f"\u2694\ufe0f <b>{html.escape(fmt_pair(sel_pair))}</b>\n"
+                f"{tf_label(sel_time)}\n\n"
+                f"\U0001f48e Pair: <b>{html.escape(fmt_pair(sel_pair))}</b>\n"
+                f"\u23f1 Time: <b>{tf_label(sel_time)}</b>\n\n"
+                "Press the button below to get a signal")
+        if edit_mid:
+            edit(text, chat, edit_mid, html_on=True)
+            api_call("editMessageReplyMarkup", {"chat_id": chat, "message_id": edit_mid, "reply_markup": {"inline_keyboard": kb_get_signal()}})
+        else:
+            send(text, chat_id=chat, keyboard=kb_get_signal(), html_on=True)
 
     def send_result(res, chat, m, conf, closes):
         pair_txt = fmt_pair(sel_pair)
@@ -2709,8 +2797,10 @@ if __name__ == "__main__":
                     sel_time = 60
                 persist()
                 warm_feed(sel_pair, sel_time)
-                run_generation(chat)
+                send_signal_ready_screen(chat)
             elif data == "sig:again":
+                run_generation(chat)
+            elif data == "sig:get":
                 run_generation(chat)
             elif data.startswith("acc:"):
                 parts = data.split(":")
