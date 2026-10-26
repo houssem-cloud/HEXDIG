@@ -234,7 +234,12 @@ def _fetch_candles(api, sym, period, count, block=True):
     partial = []
     if legacy is not None:
         try:
-            data = list(legacy(sym, int(period), count) or [])
+            # the SDK deprecates get_candles in favour of get_candles_live,
+            # which is a much heavier streaming API; keep using the fast path
+            # while it exists and silence the per-call warning
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                data = list(legacy(sym, int(period), count) or [])
             # small requests are fine with the legacy window; large ones must
             # prove they actually returned the extra history
             if data and (len(data) >= count or count <= 260):
