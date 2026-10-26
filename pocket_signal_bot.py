@@ -1997,13 +1997,25 @@ def no_trade_text(res, m, pair, tf_txt):
     n = res.get("full_total", 0)
     reason = res.get("gate_note") or "No statistical edge right now."
     src = "Validated edge" if res.get("validated") else "Measured edge"
+    intro = {
+        "sample": "Not enough resolved signals in the recent history to "
+                  "measure an edge yet - no BUY/SELL is issued.",
+        "accuracy": "The measured accuracy is below the minimum "
+                    f"({MIN_ACCURACY:.0f}%), so no BUY/SELL is issued.",
+        "payout": "Payout is unavailable or too low, so no BUY/SELL is issued.",
+    }.get(res.get("gate_reason", ""),
+          "This setup does not clear the break-even bar, "
+          "so no BUY/SELL is issued.")
+    if n:
+        edge_txt = f"<b>{edge:.0f}%</b> over {n} setups"
+    else:
+        edge_txt = "<b>n/a</b> (not enough history yet)"
     lines = [
         f"\U0001f6ab <b>NO TRADE</b> \u2014 {html.escape(fmt_pair(pair))} | {tf_txt}",
         "",
         "This setup does not clear the break-even bar, so no BUY/SELL is issued.",
         "",
-        f"\u2022 {src}: <b>{edge:.0f}%</b>"
-        + (f" over {n} setups" if n else ""),
+        f"\u2022 {src}: {edge_txt}",
         f"\u2022 Break-even needed: <b>{be:.0f}%</b>" if be
         else "\u2022 Break-even: n/a (no payout)",
         f"\u2022 Payout: <b>{payout:.0f}%</b>" if payout
@@ -2613,13 +2625,16 @@ if __name__ == "__main__":
         m = tech_metrics(closes, ohlc, res)
         conf = gate_score(res, sel_model)
 
-        params = MODEL_PARAMS[sel_model]
+        # 0% with no samples reads as "terrible"; the honest display is N/A
+        acc_total = res.get("full_total", 0) or 0
+        acc_step = ("\u2014 (no history yet)" if acc_total <= 0 else
+                    f"{res.get('full_acc', 0):.0f}% ({acc_total} past signals)")
         reveal_vals = [
             f"{m['vol']} \u26a1",
             m["rsi_label"],
             m["macd"],
             m["ma"],
-            f"{res.get('full_acc', 0):.0f}% ({res.get('full_total', 0)} past signals)",
+            acc_step,
         ]
         for idx, val in enumerate(reveal_vals):
             values.append(val)
