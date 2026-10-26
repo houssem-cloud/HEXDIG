@@ -732,5 +732,64 @@ class TestRiskStop(unittest.TestCase):
         self.assertFalse(bot.risk_daily_block())
 
 
+class TestAccountSync(unittest.TestCase):
+    """End-to-end coverage of sync_account_trades (regression: a dropped
+    `new_seen = []` initializer raised NameError, only visible as a print)."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp()
+        self.origs = (bot.ML_DATA_FILE, bot.TRACK_FILE, bot.RESULTS_FILE,
+                      bot.pocket_payout, bot.send)
+        bot.ML_DATA_FILE = os.path.join(tmp, "ml_data.json")
+        bot.TRACK_FILE = os.path.join(tmp, "track.json")
+        bot.RESULTS_FILE = os.path.join(tmp, "results.json")
+        bot.send = lambda *a, **k: None
+
+        self.deal = {"id": "d1", "asset": "EURUSD-OTC", "entry": 1.1000,
+                     "exit": 1.1050, "profit": 0.85, "win": True,
+                     "refund": False, "demo": True,
+                     "open_ts": int(time.time()) - 120,
+                     "close_ts": int(time.time()) - 60, "tf": 60}
+
+        class FakePP:
+            @staticmethod
+            def _norm(p):
+                return str(p).upper().replace("/", "")
+
+            @staticmethod
+            def account_trades(max_tries=1):
+                return [dict(self.deal)]
+
+        bot.pocket_payout = FakePP
+        # keep the sync from hitting any network path
+        bot._acct_raw = lambda asset, ts0: []
+
+    def tearDown(self):
+        (bot.ML_DATA_FILE, bot.TRACK_FILE, bot.RESULTS_FILE,
+         bot.pocket_payout, bot.send) = self.origs
+
+    def test_sync_records_deal_without_error(self):
+        try:
+            bot.sync_account_trades()
+        except Exception as e:
+            self.fail(f"sync_account_trades raised: {e!r}")
+        d = bot._ml_data_load()
+        self.assertIn("d1", [str(x) for x in (d.get("seen_deals") or [])])
+        tr = bot.track_load()
+        accts = [x for x in tr["settled"] if x.get("source") == "account"]
+        self.assertEqual(len(accts), 1)
+        self.assertTrue(accts[0]["win"])
+
+    def test_sync_is_idempotent(self):
+        bot.sync_account_trades()
+        bot.sync_account_trades()
+        d = bot._ml_data_load()
+        self.assertEqual([str(x) for x in (d.get("seen_deals") or [])],
+                         ["d1"])
+        accts = [x for x in bot.track_load()["settled"]
+                 if x.get("source") == "account"]
+        self.assertEqual(len(accts), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

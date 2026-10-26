@@ -1347,6 +1347,7 @@ def sync_account_trades():
     except Exception:
         return
     seen = set(str(x) for x in (d.get("seen_deals") or []))
+    new_seen = []
     acct_settled = []
     changed = False
     new_ts = {}
