@@ -7,7 +7,6 @@ returns bullish/bearish votes for the signal engine.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import numpy as np
 import pandas as pd
 
 
@@ -79,11 +78,14 @@ def recognize(df: pd.DataFrame) -> list[Pattern]:
             out.append(Pattern("Evening Star", -1, 1.5, "Evening star reversal"))
 
     # --- Tweezer tops / bottoms --------------------------------------------
-    tol = rng * 0.001 * 1000        # small tolerance relative to candle range
-    if abs(l[i] - l[i - 1]) < tol and c[i] > o[i]:
+    # Equal highs/lows must be genuinely close (about half a pip), not "within
+    # one candle range" — the previous tolerance made this fire on almost every
+    # candle and skewed the confluence score.
+    tol = max(abs(c[i]) * 5e-5, 1e-9)
+    if (abs(l[i] - l[i - 1]) <= tol and c[i] > o[i] and c[i - 1] < o[i - 1]):
         out.append(Pattern("Tweezer Bottom", +1, 0.8, "Tweezer bottom"))
 
-    if abs(h[i] - h[i - 1]) < tol and c[i] < o[i]:
+    if (abs(h[i] - h[i - 1]) <= tol and c[i] < o[i] and c[i - 1] > o[i - 1]):
         out.append(Pattern("Tweezer Top", -1, 0.8, "Tweezer top"))
 
     return out

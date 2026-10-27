@@ -67,19 +67,25 @@ def analyze(df: pd.DataFrame, expiry_line: str = "1 minute") -> Signal | None:
     warnings: list[str] = []
 
     # ---------------- Bollinger stretch (reversion) -----------------------
-    if price <= float(lo2.iloc[-1]):
+    # A zero-width band (flat market) is not a "touch" — requiring width stops
+    # a dead series from generating a fake BUY.
+    band2_ok = (not pd.isna(up2.iloc[-1])) and float(up2.iloc[-1]) > float(lo2.iloc[-1])
+    band3_ok = (not pd.isna(up3.iloc[-1])) and float(up3.iloc[-1]) > float(lo3.iloc[-1])
+    if band2_ok and price <= float(lo2.iloc[-1]):
         votes.append(("bb", +1, 2.0)); reasons.append("Price rejected lower Bollinger Band (20, 2)")
-    elif price >= float(up2.iloc[-1]):
+    elif band2_ok and price >= float(up2.iloc[-1]):
         votes.append(("bb", -1, 2.0)); reasons.append("Price rejected upper Bollinger Band (20, 2)")
 
-    if price <= float(lo3.iloc[-1]):
+    if band3_ok and price <= float(lo3.iloc[-1]):
         votes.append(("bb3", +1, 1.0)); reasons.append("Stretched beyond BB (20, 3) — volatility extreme")
-    elif price >= float(up3.iloc[-1]):
+    elif band3_ok and price >= float(up3.iloc[-1]):
         votes.append(("bb3", -1, 1.0)); reasons.append("Stretched beyond BB (20, 3) — volatility extreme")
 
-    # Band-width squeeze -> breakout watch
+    # Band-width squeeze -> breakout watch (min_periods so short frames still work)
     bw = (up2 - lo2) / mid2
-    if float(bw.iloc[-1]) < float(bw.rolling(50).mean().iloc[-1]) * 0.6:
+    bw_avg = float(bw.rolling(50, min_periods=20).mean().iloc[-1])
+    bw_now = float(bw.iloc[-1])
+    if not pd.isna(bw_avg) and bw_avg > 0 and bw_now < bw_avg * 0.6:
         warnings.append("Squeeze: volatility compressed — expect fast move")
 
     # ---------------- Stochastic 6/3/3 ------------------------------------
@@ -121,11 +127,14 @@ def analyze(df: pd.DataFrame, expiry_line: str = "1 minute") -> Signal | None:
         votes.append(("ema", -1, 1.0)); reasons.append("Short-term downtrend: EMA9 < EMA21, price below EMA9")
 
     # ---------------- Heikin Ashi ------------------------------------------
-    ha_bull = ha["close"].iloc[-1] > ha["open"].iloc[-1]
-    ha_bull_prev = ha["close"].iloc[-2] > ha["open"].iloc[-2]
-    if ha_bull and ha_bull_prev and not (ha["open"].iloc[-1] - ha["close"].iloc[-1] == 0):
+    # Vote only on a real body: a doji HA candle is indecision, not a bearish run
+    # (the old code counted flat candles as consecutive bearish candles).
+    eps = max(abs(price) * 1e-9, 1e-12)
+    ha_body = float(ha["close"].iloc[-1]) - float(ha["open"].iloc[-1])
+    ha_body_prev = float(ha["close"].iloc[-2]) - float(ha["open"].iloc[-2])
+    if ha_body > eps and ha_body_prev > eps:
         votes.append(("ha", +1, 0.7)); reasons.append("Heikin Ashi: consecutive bullish candles")
-    elif (not ha_bull) and (not ha_bull_prev):
+    elif ha_body < -eps and ha_body_prev < -eps:
         votes.append(("ha", -1, 0.7)); reasons.append("Heikin Ashi: consecutive bearish candles")
 
     # ---------------- Candlestick patterns ---------------------------------
@@ -147,6 +156,9 @@ def analyze(df: pd.DataFrame, expiry_line: str = "1 minute") -> Signal | None:
         return None
 
     score = bull - bear
+    if score == 0:
+        # perfectly balanced confluence: no edge, so no direction to sell
+        return None
     direction = "BUY" if score > 0 else "SELL"
     dominant = max(bull, bear)
     agreement = dominant / total                  # 0.5 .. 1.0
@@ -169,6 +181,7 @@ def analyze(df: pd.DataFrame, expiry_line: str = "1 minute") -> Signal | None:
 
     accuracy = 55 + int(min(28, strength * 30) + (agreement - 0.5) * 22 - conf_penalty - (6 if choppy else 0))
     accuracy = max(55, min(97, accuracy))
+    adx_txt = "n/a" if pd.isna(a_now) else f"{a_now:.0f}"
 
     return Signal(
         direction=direction,
@@ -177,5 +190,5 @@ def analyze(df: pd.DataFrame, expiry_line: str = "1 minute") -> Signal | None:
         expiry_line=expiry_line,
         reasons=reasons[:6],
         warnings=warnings,
-        regime=f"ADX {a_now:.0f} | ATRx {vol_ratio:.1f}",
+        regime=f"ADX {adx_txt} | ATRx {vol_ratio:.1f}",
     )

@@ -43,7 +43,8 @@ def stochastic(df: pd.DataFrame, k_period: int = 6, d_period: int = 3,
     """
     hh = df["high"].rolling(k_period).max()
     ll = df["low"].rolling(k_period).min()
-    raw = 100.0 * (df["close"] - ll) / (hh - ll)
+    span = (hh - ll).replace(0, np.nan)      # flat window -> undefined, not inf
+    raw = 100.0 * (df["close"] - ll) / span
     k = sma(raw, smoothing)              # smoothed %K
     d = sma(k, d_period)                 # %D = SMA of %K
     return k, d
@@ -76,8 +77,9 @@ def adx(df: pd.DataFrame, di_length: int = 5, adx_smoothing: int = 1):
     ], axis=1).max(axis=1)
 
     atr_ = wilder_smooth(tr, di_length)
-    plus_di = 100.0 * wilder_smooth(pd.Series(plus_dm, index=df.index), di_length) / atr_
-    minus_di = 100.0 * wilder_smooth(pd.Series(minus_dm, index=df.index), di_length) / atr_
+    safe = atr_.replace(0, np.nan)           # zero range -> undefined DI
+    plus_di = 100.0 * wilder_smooth(pd.Series(plus_dm, index=df.index), di_length) / safe
+    minus_di = 100.0 * wilder_smooth(pd.Series(minus_dm, index=df.index), di_length) / safe
 
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx_ = wilder_smooth(dx, adx_smoothing)
@@ -102,7 +104,6 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 # ------------------------------------------------------------- Heikin Ashi
 def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
     """Heikin Ashi candles — the chart type selected in the screenshots."""
-    import numpy as np
     o = df["open"].to_numpy(dtype=float)
     h = df["high"].to_numpy(dtype=float)
     l = df["low"].to_numpy(dtype=float)
