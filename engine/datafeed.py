@@ -157,23 +157,28 @@ async def get_candles(pair: str, quote_type: str) -> tuple[pd.DataFrame | None, 
             _CACHE[key] = (time.time(), df)
             _mark_live(pair, df)
             return df, "Live spot feed (Yahoo Finance M1)"
-        # PO ssid feed also covers spot pairs when connected
-        from engine import pocketoption_ws as po
-        pdf = po.candles(pair)
+        # PO ssid library feed covers spot pairs too
+        from engine import po_feed
+        pdf = await asyncio.to_thread(po_feed.candles, pair, False)
         if pdf is not None:
-            return pdf, "Pocket Option live feed (ssid websocket)"
-        # fall through to synthetic backup
+            return pdf, "Pocket Option live feed (ssid library)"
         _mark_fallback(f"Yahoo M1 fetch failed for {pair}")
         df = _synthetic(pair, quote_type)
         _CACHE[key] = (time.time(), df)
         return df, "⚠️ Live feed unavailable — backup synthetic feed"
 
-    # OTC: try the live Pocket Option ssid feed first (that's the whole point)
+    # OTC: PO ssid library first (proven BinaryOptionsToolsV2 path)…
+    from engine import po_feed
+    pdf = await asyncio.to_thread(po_feed.candles, pair, True)
+    if pdf is not None:
+        pay = po_feed.payout_for(pair) or ""
+        pay_line = f" | payout {pay:.0f}%" if pay else ""
+        return pdf, f"Pocket Option live OTC (ssid library){pay_line}"
+    # …then the raw websocket fallback, then synthetic
     from engine import pocketoption_ws as po
     pdf = po.candles(pair)
     if pdf is not None:
-        return pdf, "Pocket Option live OTC (ssid authenticated)"
-
+        return pdf, "Pocket Option OTC (raw ssid websocket)"
     df = _synthetic(pair, quote_type)
     _CACHE[key] = (time.time(), df)
     return df, "⚠️ SSID feed not connected — OTC is synthetic"
