@@ -41,11 +41,11 @@ WS_HEADERS = {
 }
 
 # ----------------------------------------------------------- configuration
-# socket.io websocket endpoints (the web client rotates these; add more as PO changes)
-# Note: dc1-fdyp73x-wss.po.market stopped resolving (NXDOMAIN) — dropped from rotation.
+# socket.io websocket endpoints — api-eu authenticates on AWS; api-l rejected the
+# upgrade (403/200) in probe tests — kept as deep fallback.
 ENDPOINTS = [
-    "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
     "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket",
+    "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
 ]
 
 # Engine pair -> Pocket Option asset names (OTC first, fallback spot)
@@ -110,6 +110,7 @@ class POFeed:
         self._task: asyncio.Task | None = None
         self._stop = False
         self._seen_events: set[str] = set()
+        self._pending_binary_event: str | None = None   # 451- event awaiting payload
 
     # ------------------------------------------------------------ lifecycle
     async def run(self):
@@ -168,14 +169,49 @@ class POFeed:
                           "Likely causes: ssid expired (log out of the browser kills it), "
                           "frame truncated in transit, or session bound to another "
                           "device/IP. Re-capture the ssid and retry.")
+                self.connected = False
                 return
 
             if raw.startswith("2"):                     # socket.io PING -> PONG
                 await ws.send("3")
                 return
-            if raw.startswith("451-"):                  # socket.io BINARY event
-                raw = raw[4:].lstrip("-")               # strip the engine prefix
-                log.debug("PO binary frame: %.120s", raw)
+
+            # ---- 451- binary EVENT: payload follows as the next binary frame ----
+            if raw.startswith("451-"):
+                try:
+                    body = json.loads(raw[4:].lstrip("-"))
+                    event = body[0] if isinstance(body, list) and body else "?"
+                    first = body[1] if isinstance(body, list) and len(body) > 1 else {}
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    log.debug("PO 451 parse fail: %.120s", raw)
+                    return
+                if isinstance(first, dict) and "_placeholder" in first:
+                    self._pending_binary_event = event
+                    log.debug("PO binary event pending: %s", event)
+                else:                                   # inline payload, no attachment
+                    self._dispatch(event, first)
+                return
+
+            # ---- the binary attachment that follows a 451- placeholder ------
+            if self._pending_binary_event and not raw.startswith("42"):
+                event = self._pending_binary_event
+                self._pending_binary_event = None
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    log.info("PO event (new, logged for tuning): %s — attachment not "
+                             "plain JSON: %.120s", event, raw)
+                    return
+                # socket.io attachment form: [{"num":0}, <payload>, ...]
+                if isinstance(data, list) and data and isinstance(data[0], dict) and "num" in data[0]:
+                    args = data[1:]
+                    payload = args[0] if len(args) == 1 else args
+                elif isinstance(data, list) and data:
+                    payload = data[1] if len(data) > 1 else data
+                else:
+                    payload = data
+                self._dispatch(event, payload)
+                return
 
             if not raw.startswith("42"):
                 log.debug("PO frame: %.120s", raw)      # 40/metadata frames — logged for tuning
@@ -211,20 +247,29 @@ class POFeed:
     # ------------------------------------------------------------ ingestion
     def _ingest_ticks(self, payload):
         """
-        Accepts whatever tick shape PO uses:
-            [[ts_ms, price], ...] | {asset:.., price:.., time:..} | {asset: [...]}
+        Accepts whatever tick shape PO streams:
+            [asset, ts, price] triples  |  [ts, price] pairs  |  dicts with keys
         """
         def tick(obj):
-            if isinstance(obj, (list, tuple)) and len(obj) >= 2:
-                ts, price = float(obj[0]) / 1000.0 if float(obj[0]) > 1e10 else float(obj[0]), float(obj[1])
-                return None, ts, price
-            if isinstance(obj, dict):
-                ts = obj.get("ts") or obj.get("time") or obj.get("timestamp")
-                price = obj.get("price") or obj.get("quote")
-                asset = obj.get("asset") or obj.get("symbol") or obj.get("pair")
-                if ts and price:
-                    ts = float(ts) / 1000.0 if float(ts) > 1e10 else float(ts)
-                    return asset, ts, float(price)
+            try:
+                if isinstance(obj, (list, tuple)) and len(obj) >= 2:
+                    if len(obj) >= 3 and isinstance(obj[0], str):
+                        asset, ts, price = obj[0], obj[1], obj[2]
+                    else:
+                        asset, ts, price, _ = None, obj[0], obj[1], None
+                    ts_f, price_f = float(ts), float(price)
+                    if ts_f > 1e10:                       # ms epoch -> seconds
+                        ts_f /= 1000.0
+                    return asset, ts_f, price_f
+                if isinstance(obj, dict):
+                    ts = obj.get("ts") or obj.get("time") or obj.get("timestamp")
+                    price = obj.get("price") or obj.get("quote")
+                    asset = obj.get("asset") or obj.get("symbol") or obj.get("pair")
+                    if ts and price:
+                        ts_f = float(ts)
+                        return asset, ts_f / 1000.0 if ts_f > 1e10 else ts_f, float(price)
+            except (TypeError, ValueError):
+                pass                                      # unknown element shape
             return None, None, None
 
         for item in (payload if isinstance(payload, list) else [payload]):
