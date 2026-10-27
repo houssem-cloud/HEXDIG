@@ -126,14 +126,20 @@ finally:
 
 # 6) payout lookup must not borrow another asset's number ---------------------
 class _FakeAPI:
-    def __init__(self, mapping):
+    def __init__(self, mapping, active=None):
         self.mapping = mapping
+        self.active = active or []
 
     def is_connected(self):
         return True
 
-    def payout(self):
+    def payout(self, asset=None):
+        if asset is not None:
+            return self.mapping.get(asset) if isinstance(self.mapping, dict) else None
         return self.mapping
+
+    def active_assets(self):
+        return self.active
 
 
 orig_api = po_feed._CLIENT.get("api")
@@ -143,6 +149,23 @@ try:
     po_feed._CLIENT["api"] = _FakeAPI({"GBPJPY_otc": 92})
     assert po_feed.payout_for("EUR/USD") is None      # never a random asset
     print("payout: exact asset only               OK")
+
+    # Server shape: the bulk map comes back empty, but the active-asset list
+    # (loaded at connect) still carries the broker's payout for each symbol.
+    active = [{"symbol": "EURUSD_otc", "payout": 83, "is_active": True},
+              {"symbol": "GBPJPY_otc", "payout": 79, "is_active": True}]
+    po_feed._CLIENT["api"] = _FakeAPI({}, active)
+    assert po_feed.payout_for("EUR/USD") == 83.0
+    assert po_feed.payout_for("GBP/JPY") == 79.0
+    assert po_feed.payout_for("USD/CHF") is None
+    assert po_feed.payouts().get("EURUSD-OTC") == 83.0
+    print("payout: asset-list fallback            OK")
+
+    # Library builds differ in how a percentage is encoded; all mean the same.
+    norm = po_feed._normalize_payouts({"EURUSD_otc": "92%", "GBPUSD_otc": 0.88,
+                                       "USDJPY_otc": 0, "AUDUSD_otc": None})
+    assert norm == {"EURUSD-OTC": 92.0, "GBPUSD-OTC": 88.0}, norm
+    print("payout: percent encodings               OK")
 finally:
     po_feed._CLIENT["api"] = orig_api
 

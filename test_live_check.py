@@ -41,6 +41,7 @@ def check_maps():
 
 async def check_otc():
     live = refused = 0
+    missing_pay = 0
     worst_age = 0.0
     for pair in PAIRS:
         t = time.monotonic()
@@ -58,11 +59,20 @@ async def check_otc():
         worst_age = max(worst_age, age)
         sig = analyze(df, "1 minute")
         live += 1
+        if "payout n/a" in note:
+            missing_pay += 1
         _report(age <= po_feed._HARD_STALE and len(df) >= 60,
                 f"{pair:8s} OTC {len(df):3d} bars | age {age:4.0f}s | {took:4.1f}s "
                 f"| {sig.direction if sig else 'no signal':9s} | {note}")
     print(f"     OTC summary: {live} live, {refused} refused, "
           f"oldest accepted bar {worst_age:.0f}s")
+    # A payout may be missing for a moment on one asset, but "n/a" on most live
+    # pairs means the payout source broke (seen on AWS with an empty bulk map).
+    limit = max(1, live // 5)
+    _report(missing_pay <= limit,
+            f"OTC payouts: {live - missing_pay}/{live} live pairs have a payout "
+            f"(missing {missing_pay}, allowed {limit}) | "
+            f"{po_feed.payout_issue() or 'source ok'}")
 
 
 async def check_stock():
@@ -85,7 +95,8 @@ def check_payouts():
     exact = po_feed.payout_for("EUR/USD")
     unknown = po_feed.payout_for("XYZ/ABC")
     _report(unknown is None,
-            f"payout exactness: EUR/USD-OTC={exact} | unknown pair={unknown}")
+            f"payout exactness: EUR/USD-OTC={exact} | unknown pair={unknown} | "
+            f"{po_feed.payout_issue() or 'source ok'}")
 
 
 async def main_async():

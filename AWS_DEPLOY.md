@@ -114,6 +114,16 @@ Run the full live check after deploying (it requests every OTC pair, ~4 min):
 sudo venv/bin/python test_live_check.py
 ```
 
+If the live check reports `payout n/a` on most pairs, dump the raw payout shape
+(no secrets are printed) and keep the output:
+
+```bash
+sudo venv/bin/python tools/payout_probe.py EURUSD_otc
+```
+
+It shows the bulk `payout()` type/size, the per-symbol lookup, and the payout
+field in the active-asset list, plus the exact library/pandas versions.
+
 Pocket Option rotates its OTC line-up. A pair that is not currently tradeable is
 **refused** by the bot with an explanation instead of being analysed — that is
 expected, not a bug. Re-run the live check later to see the current list.

@@ -63,7 +63,9 @@ not guarantee outcomes.** Binary options are high-risk; this tool is for analysi
   synthetic series left is the clearly-labelled Stock fallback used when no live
   source is reachable at all (total network failure).
 - Payout percentages come from the broker and are shown for the requested asset only.
-  OTC assets must be both active and have a payout, otherwise they are refused.
+  They are read per symbol and, if the bulk payout map is empty (some library
+  builds), from the payout field of Pocket Option's active-asset list. A missing
+  payout never blocks a signal — the footer says `payout n/a` instead.
 
 Set the session up once:
 

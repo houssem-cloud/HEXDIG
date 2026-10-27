@@ -116,6 +116,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ps.get("connected"):
         po_line = (f"🟢 Pocket Option LIVE via ssid library — assets={ps['assets']} "
                    f"(otc {ps['otc_assets']}) | EURUSD-OTC payout {pay_txt}")
+        if not pay and ps.get("payout_error"):
+            po_line += f"\n   payout source: {escape(str(ps['payout_error']))}"
     elif ps.get("library") in ("env", "file"):
         po_line = ("🟡 ssid present but not connected — "
                    + escape(str(ps.get("error") or "connecting on first signal")))
@@ -144,8 +146,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\nℹ️ Your Wi-Fi/SSID name is not a data source — the bot reads the internet, "
           "so any connection works.\n\n"
           "📈 <b>Stock pairs</b>: real live 1-min spot candles\n"
-          "🧪 <b>OTC pairs</b>: live from Pocket Option when ssid is configured, "
-          "otherwise deterministic synthetic feed.",
+          "🧪 <b>OTC pairs</b>: live from Pocket Option when ssid is configured; "
+          "if the broker feed is down the bot refuses instead of inventing prices.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -362,6 +364,16 @@ def main():
 
     async def _boot_check(_app: Application):
         from engine.datafeed import has_internet
+
+        try:
+            from importlib.metadata import version
+            import pandas as _pd
+            log.info("Deps: BinaryOptionsToolsV2 %s | pandas %s | python %s",
+                     version("BinaryOptionsToolsV2"), _pd.__version__,
+                     __import__("sys").version.split()[0])
+        except Exception:
+            pass
+
         ok = await asyncio.to_thread(has_internet)
         log.info("Startup connectivity check: %s",
                  "LIVE FEED REACHABLE ✅" if ok
@@ -371,10 +383,12 @@ def main():
         if po_feed.load_ssid():
             warm = await asyncio.to_thread(po_feed.warm)
             st = await asyncio.to_thread(po_feed.status)
-            log.info("PO library feed (BinaryOptionsToolsV2): %s | assets=%s otc=%s %s",
+            log.info("PO library feed (BinaryOptionsToolsV2): %s | assets=%s otc=%s "
+                     "payout=%s %s",
                      "READY — LIVE OTC CANDLES ENABLED ✅" if warm
                      else "FAILED — will retry on first signal ❌",
-                     st.get("assets", 0), st.get("otc_assets", 0), st.get("error", "")[:80])
+                     st.get("assets", 0), st.get("otc_assets", 0),
+                     st.get("sample_payout"), st.get("error", "")[:80])
         else:
             log.info("PO ssid not configured (PO_SSID empty / no pocket_ssid.json) — "
                      "OTC stays synthetic")
