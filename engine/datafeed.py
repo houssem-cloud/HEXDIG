@@ -13,6 +13,7 @@ keeps working (a warning is attached to output candles).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import time
 
@@ -151,7 +152,6 @@ async def get_candles(pair: str, quote_type: str) -> tuple[pd.DataFrame | None, 
         return cached[1], note
 
     if quote_type == "STOCK":
-        import asyncio
         df = await asyncio.to_thread(_yahoo, pair)
         if df is not None and len(df) >= 60:
             _CACHE[key] = (time.time(), df)
@@ -181,6 +181,8 @@ async def get_candles(pair: str, quote_type: str) -> tuple[pd.DataFrame | None, 
         return pdf, "Pocket Option OTC (raw ssid websocket)"
     df = _synthetic(pair, quote_type)
     _CACHE[key] = (time.time(), df)
+    if po_feed.is_ready():
+        return df, f"⚠️ {pair} OTC not in PO's active list right now — synthetic fallback"
     return df, "⚠️ SSID feed not connected — OTC is synthetic"
 
     df = _synthetic(pair, quote_type)

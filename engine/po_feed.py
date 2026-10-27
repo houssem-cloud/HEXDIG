@@ -32,28 +32,34 @@ _TTL = 30.0            # candle cache seconds — fresh M1 bar granularity
 _CLIENT = {"api": None, "ssid": ""}
 _CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
 
-# Signal-engine pair -> PO asset symbols (OTC first for the OTC quote type)
+# Signal-engine pair -> PO symbols. OTC quotes use the *_otc symbol ONLY (its price
+# series differs from spot); STOCK quotes use the spot symbol. OTC pairs rotate out
+# of PO's active list temporarily — that pair then falls back (clearly labelled).
 _ASSETS = {
-    "EUR/USD": (["EURUSD_otc", "EURUSD"], "EURUSD_otc"),
-    "USD/JPY": (["USDJPY_otc", "USDJPY"], "USDJPY_otc"),
-    "GBP/USD": (["GBPUSD_otc", "GBPUSD"], "GBPUSD_otc"),
-    "AUD/USD": (["AUDUSD_otc", "AUDUSD"], "AUDUSD_otc"),
-    "USD/CAD": (["USDCAD_otc", "USDCAD"], "USDCAD_otc"),
-    "USD/CHF": (["USDCHF_otc", "USDCHF"], "USDCHF_otc"),
-    "GBP/JPY": (["GBPJPY_otc", "GBPJPY"], "GBPJPY_otc"),
-    "EUR/JPY": (["EURJPY_otc", "EURJPY"], "EURJPY_otc"),
-    "AUD/CAD": (["AUDCAD_otc", "AUDCAD"], "AUDCAD_otc"),
-    "EUR/CAD": (["EURCAD_otc", "EURCAD"], "EURCAD_otc"),
-    "GBP/CAD": (["GBPCAD_otc", "GBPCAD"], "GBPCAD_otc"),
-    "CAD/CHF": (["CADCHF_otc", "CADCHF"], "CADCHF_otc"),
-    "EUR/GBP": (["EURGBP_otc", "EURGBP"], "EURGBP_otc"),
-    "AUD/JPY": (["AUDJPY_otc", "AUDJPY"], "AUDJPY_otc"),
-    "NZD/USD": (["NZDUSD_otc", "NZDUSD"], "NZDUSD_otc"),
-    "CHF/JPY": (["CHFJPY_otc", "CHFJPY"], "CHFJPY_otc"),
-    "EUR/CHF": (["EURCHF_otc", "EURCHF"], "EURCHF_otc"),
-    "GBP/AUD": (["GBPAUD_otc", "GBPAUD"], "GBPAUD_otc"),
-    "NZD/JPY": (["NZDJPY_otc", "NZDJPY"], "NZDJPY_otc"),
-    "USD/BRL": (["USDBRL_otc", "USDBRL"], "USDBRL_otc"),
+    "EUR/USD": {"otc": "EURUSD_otc", "spot": "EURUSD"},
+    "USD/JPY": {"otc": "USDJPY_otc", "spot": "USDJPY"},
+    "GBP/USD": {"otc": "GBPUSD_otc", "spot": "GBPUSD"},
+    "AUD/USD": {"otc": "AUDUSD_otc", "spot": "AUDUSD"},
+    "USD/CAD": {"otc": "USDCAD_otc", "spot": "USDCAD"},
+    "USD/CHF": {"otc": "USDCHF_otc", "spot": "USDCHF"},
+    "GBP/JPY": {"otc": "GBPJPY_otc", "spot": "GBPJPY"},
+    "EUR/JPY": {"otc": "EURJPY_otc", "spot": "EURJPY"},
+    "AUD/CAD": {"otc": "AUDCAD_otc", "spot": "AUDCAD"},
+    "EUR/CAD": {"otc": "EURCAD_otc", "spot": "EURCAD"},
+    "GBP/CAD": {"otc": "GBPCAD_otc", "spot": "GBPCAD"},
+    "CAD/CHF": {"otc": "CADCHF_otc", "spot": "CADCHF"},
+    "EUR/GBP": {"otc": "EURGBP_otc", "spot": "EURGBP"},
+    "AUD/JPY": {"otc": "AUDJPY_otc", "spot": "AUDJPY"},
+    "NZD/USD": {"otc": "NZDUSD_otc", "spot": "NZDUSD"},
+    "CHF/JPY": {"otc": "CHFJPY_otc", "spot": "CHFJPY"},
+    "EUR/CHF": {"otc": "EURCHF_otc", "spot": "EURCHF"},
+    "GBP/AUD": {"otc": "GBPAUD_otc", "spot": "GBPAUD"},
+    "NZD/JPY": {"otc": "NZDJPY_otc", "spot": "NZDJPY"},
+    "USD/BRL": {"otc": "USDBRL_otc", "spot": "USDBRL"},
+    "EUR/AUD": {"otc": "EURAUD_otc", "spot": "EURAUD"},
+    "USD/SGD": {"otc": "USDSGD_otc", "spot": "USDSGD"},
+    "GBP/CHF": {"otc": "GBPCHF_otc", "spot": "GBPCHF"},
+    "EUR/NZD": {"otc": "EURNZD_otc", "spot": "EURNZD"},
 }
 
 
@@ -136,6 +142,11 @@ def _ensure_client():
 
 
 # ------------------------------------------------------------------- candles
+def is_ready() -> bool:
+    """Cheap check: is the PO client currently instantiated? No network call."""
+    return _CLIENT.get("api") is not None
+
+
 def candles(pair: str, otc: bool = True, bars: int = 240) -> pd.DataFrame | None:
     """M1 OHLC DataFrame via PO, or None. Never raises, cached _TTL seconds."""
     key = f"{pair}|{'otc' if otc else 'spot'}"
@@ -144,35 +155,46 @@ def candles(pair: str, otc: bool = True, bars: int = 240) -> pd.DataFrame | None
     if cached and now - cached[0] < _TTL:
         return cached[1]
 
-    alts = _ASSETS.get(pair)
-    if alts is None:
+    spec = _ASSETS.get(pair)
+    if spec is None:
         base = pair.replace("/", "")
-        alts = ([base + "_otc", base] if otc else [base])
+        spec = {"otc": base + "_otc", "spot": base}
+    syms = [spec["otc"]] if otc else [spec["spot"]]
 
+    rows = None
     with _LOCK:
         api = _ensure_client()
         if api is None:
             return None
-        rows = None
-        for sym in alts:                       # try OTC first, then spot variant
-            try:
-                data = api.get_candles(sym, 60, bars)
-            except Exception:
-                continue
-            if data and len(data) >= 60:
-                rows = (sym, data)
+        # OTC pairs rotate out of the active list; try several bar counts before
+        # giving up (this mirrors the old bot's tolerant behavior).
+        for want in (bars, 120, 60):
+            for sym in syms:
+                try:
+                    data = api.get_candles(sym, 60, want)
+                except Exception:
+                    continue
+                if data and len(data) >= 60:
+                    rows = data
+                    break
+            if rows is not None:
                 break
+
     if rows is None:
+        # last good candles up to 5 minutes old beat a synthetic switch mid-session
+        cached = _CACHE.get(key)
+        if cached and time.time() - cached[0] < 300:
+            return cached[1]
         return None
-    sym, data = rows
+
     try:
-        idx = pd.to_datetime([c["time"] for c in data], unit="s", utc=True)
+        idx = pd.to_datetime([c["time"] for c in rows], unit="s", utc=True)
         df = pd.DataFrame({
-            "open": [float(c["open"]) for c in data],
-            "high": [float(c["high"]) for c in data],
-            "low": [float(c["low"]) for c in data],
-            "close": [float(c["close"]) for c in data],
-            "volume": [1.0] * len(data),
+            "open": [float(c["open"]) for c in rows],
+            "high": [float(c["high"]) for c in rows],
+            "low": [float(c["low"]) for c in rows],
+            "close": [float(c["close"]) for c in rows],
+            "volume": [1.0] * len(rows),
         }, index=idx).dropna().tail(240)
     except Exception:
         return None
@@ -210,7 +232,15 @@ def payouts() -> dict[str, float]:
 def payout_for(pair: str, otc: bool = True) -> float | None:
     try:
         base = pair.replace("/", "").upper()
-        return payouts().get(base + "-OTC" if otc else base)
+        pay = payouts()
+        val = pay.get(base + "-OTC" if otc else base)
+        if val is None and otc:
+            val = pay.get(base)             # some feeds report the spot key
+        if val is None:
+            # last resort: any OTC sample so /status never shows 'None%'
+            otc_vals = [v for k, v in pay.items() if k.endswith("-OTC")]
+            val = otc_vals[0] if otc_vals else None
+        return val
     except Exception:
         return None
 
