@@ -14,7 +14,7 @@ import sys
 
 sys.path.insert(0, ".")
 
-from engine.pocketoption_ws import ENDPOINTS, normalize_ssid
+from engine.pocketoption_ws import ENDPOINTS, WS_HEADERS, normalize_ssid
 
 
 async def probe(ssid: str, frames_to_show: int = 6):
@@ -27,7 +27,7 @@ async def probe(ssid: str, frames_to_show: int = 6):
         print("ENDPOINT:", host)
         try:
             async with websockets.connect(url, open_timeout=10,
-                                          additional_headers={"Origin": "https://pocketoption.com"}) as ws:
+                                          additional_headers=WS_HEADERS) as ws:
                 print("  TLS connect ......... OK")
                 await ws.send("40")
                 print("  socket.io handshake . sent 40")
@@ -48,6 +48,12 @@ async def probe(ssid: str, frames_to_show: int = 6):
                         print(f"\n  RESULT {host}: PASS — session accepted")
                         results.append((host, "PASS"))
                         break
+                    if raw.startswith("41"):
+                        print(f"\n  RESULT {host}: SESSION-REJECTED — server sent socket.io "
+                              f"disconnect (41) after auth: ssid expired/truncated or "
+                              f"bound to another device/IP")
+                        results.append((host, "SESSION-REJECTED"))
+                        break
                     if "error" in raw.lower() or "can't" in raw.lower():
                         print(f"\n  RESULT {host}: REJECTED — server error frame above")
                         results.append((host, "REJECTED"))
@@ -65,11 +71,11 @@ async def probe(ssid: str, frames_to_show: int = 6):
     for host, r in results:
         print(f"  {host:<28} {r}")
     print("Interpretation:")
-    print("  FAIL:*  on every endpoint  -> AWS datacenter IP likely blocked by PO")
-    print("           (try again from a home IP, or use a PO-allowed region)")
-    print("  NO-AUTH-REPLY             -> handshake ok, event names may have")
-    print("                              changed; send the frames above for tuning")
-    print("  REJECTED                  -> ssid expired/malformed; re-capture from F12")
+    print("  FAIL:*  403 on upgrade      -> browser headers missing/blocked (should be")
+    print("                                 gone now; survives only if IP blocked)")
+    print("  SESSION-REJECTED            -> ssid expired/truncated, or device/IP-bound;")
+    print("                                 re-capture from F12 and try the demo ssid")
+    print("  NO-AUTH-REPLY               -> send the frames above for event-name tuning")
 
 
 if __name__ == "__main__":
