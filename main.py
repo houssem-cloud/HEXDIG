@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from html import escape, unescape
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -22,7 +24,7 @@ from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes)
 
-from engine.datafeed import get_candles
+from engine.datafeed import DELAY_WARN, bar_age, get_candles
 from engine.signals import analyze
 
 load_dotenv()
@@ -99,21 +101,29 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hs = feed_health()
     age = hs.get("live_candle_age") if isinstance(hs, dict) else None
 
-    conn = "🟢 Internet reachable" if online else "🔴 No outbound internet — signals fall back to synthetic"
+    conn = ("🟢 Internet reachable" if online
+            else "🔴 No outbound internet — Stock falls back to a labelled synthetic series")
 
     # Pocket Option ssid: library feed (BinaryOptionsToolsV2)
     from engine import po_feed
-    ps = await asyncio.to_thread(po_feed.status)
+    try:
+        ps = await asyncio.wait_for(asyncio.to_thread(po_feed.status), timeout=40)
+    except asyncio.TimeoutError:
+        ps = {"connected": False, "library": "file",
+              "error": "status request timed out (feed busy)"}
+    pay = ps.get("sample_payout")
+    pay_txt = f"{pay:.0f}%" if pay else "n/a"
     if ps.get("connected"):
         po_line = (f"🟢 Pocket Option LIVE via ssid library — assets={ps['assets']} "
-                   f"(otc {ps['otc_assets']}) | EURUSD-OTC payout {ps['sample_payout']}%")
+                   f"(otc {ps['otc_assets']}) | EURUSD-OTC payout {pay_txt}")
     elif ps.get("library") in ("env", "file"):
-        po_line = f"🟡 ssid present but not connected — {ps.get('error') or 'connecting on first signal'}"
+        po_line = ("🟡 ssid present but not connected — "
+                   + escape(str(ps.get("error") or "connecting on first signal")))
     else:
         po_line = "⚪ ssid not configured — live OTC disabled (add PO_SSID or pocket_ssid.json)"
 
     if age is None:
-        feed_line = "⚪ No live fetch yet — run a Stock signal once"
+        feed_line = "⚪ No live fetch yet — request a signal once"
     elif age < 120:
         feed_line = (f"🟢 Live feed healthy — last M1 pull {age:.0f}s ago "
                      f"({hs.get('last_live_pair', '?')}, {hs.get('last_live_bars', 0)} bars)")
@@ -122,7 +132,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fb = int(hs.get("fallback_today", 0) or 0)
     if fb:
-        feed_line += f"\n🟡 Synthetic fallbacks used since start: {fb}"
+        feed_line += f"\n🟡 Feed fallbacks/refusals since start: {fb}"
 
     err = hs.get("last_error", "")
     await update.effective_message.reply_text(
@@ -130,7 +140,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 {conn}\n"
         f"📡 {feed_line}\n"
         f"💹 {po_line}\n"
-        + (f"⚠️ Last feed error: <code>{err}</code>\n" if err else "")
+        + (f"⚠️ Last feed error: <code>{escape(err)}</code>\n" if err else "")
         + "\nℹ️ Your Wi-Fi/SSID name is not a data source — the bot reads the internet, "
           "so any connection works.\n\n"
           "📈 <b>Stock pairs</b>: real live 1-min spot candles\n"
@@ -207,8 +217,25 @@ async def cb_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------ signal flow
-PROG_STEPS = [10, 25, 45, 65, 80, 92, 100]
-FETCH_TIMEOUT = 25  # seconds
+PROG_STEPS = [8, 18, 30, 42, 54, 66, 76, 84, 90, 92]
+PROG_DELAY = 0.4
+# The broker handshake can take 13 s and the live fetch ~6 s, so the cap must be
+# wider than the 22 s fresh-fetch budget in po_feed; otherwise a slow-but-working
+# feed is reported as a timeout.
+FETCH_TIMEOUT = 35  # seconds
+
+
+async def _progress(q, step: int, dots: str = ""):
+    filled = max(1, step // 10)
+    bar = "■" * filled + "□" * (10 - filled)
+    try:
+        await q.edit_message_text(
+            f"👩‍💻 <b>Analyzing…</b>\n\n"
+            f"▫️ Analyzing the market  [{bar}] {step}%{dots}",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # rate-limit / "message not modified" — cosmetic only
 
 
 async def cb_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,50 +243,59 @@ async def cb_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     _, quote, pair, label = q.data.split(":", 3)
 
-    # Start the data fetch NOW so it runs in parallel with the animation
-    # (yfinance can take a few seconds — don't make the user wait after 100%).
+    # Start the data fetch NOW so it runs in parallel with the animation.
     fetch = asyncio.create_task(get_candles(pair, quote))
+    deadline = time.monotonic() + FETCH_TIMEOUT
 
-    # "Analyzing the market" progress animation (like the screenshots)
     for step in PROG_STEPS:
-        filled = step // 10
-        bar = "■" * filled + "□" * (10 - filled)
-        try:
-            await q.edit_message_text(
-                f"👩‍💻 <b>Analyzing…</b>\n\n"
-                f"▫️ Analyzing the market  [{bar}] {step}%",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass  # rate-limit / "message not modified" — cosmetic only
-        await asyncio.sleep(0.45)
+        if fetch.done() or time.monotonic() > deadline:
+            break
+        await _progress(q, step)
+        await asyncio.sleep(PROG_DELAY)
+
+    # Slow live data: hold at 92% with a moving ellipsis instead of sitting at
+    # 100% waiting (that was the "stuck at 100%" symptom).
+    dots = 0
+    while not fetch.done() and time.monotonic() < deadline:
+        dots = (dots + 1) % 4
+        await _progress(q, 92, "." * dots)
+        await asyncio.sleep(1.2)
 
     # Deliver inline — nothing can strand the message at 100%.
-    await deliver_signal(context, q, quote, pair, label, fetch)
+    await deliver_signal(context, q, quote, pair, label, fetch, deadline)
 
 
 async def deliver_signal(context: ContextTypes.DEFAULT_TYPE, q, quote: str,
-                         pair: str, label: str, fetch: asyncio.Task):
+                         pair: str, label: str, fetch: asyncio.Task,
+                         deadline: float | None = None):
+    note = ""
+    reason = ""
+    df = None
     try:
+        remaining = FETCH_TIMEOUT if deadline is None else max(1.0, deadline - time.monotonic())
         try:
-            df, note = await asyncio.wait_for(fetch, FETCH_TIMEOUT)
+            df, note = await asyncio.wait_for(fetch, remaining)
         except asyncio.TimeoutError:
             log.warning("data fetch timeout for %s/%s", quote, pair)
-            df, note = None, "Data feed timeout"
+            df, note = None, "Data feed timeout — the broker feed did not answer in time."
         if df is not None and not df.empty:
             sig = analyze(df, expiry_line=label)
         else:
             sig = None
+            reason = note
     except Exception as e:                                    # engine never kills the bot
         log.exception("signal failed for %s %s: %s", pair, quote, e)
-        sig, note = None, "Analysis error"
+        sig, reason = None, "Analysis error — the signal engine could not read this data."
 
     try:
         if sig is None:
-            await q.edit_message_text(
-                "🎯 <b>SIGNAL UNAVAILABLE</b>\n\n"
+            # When the feed itself refused (market closed / timeout), say so
+            # instead of the generic "market is unclear".
+            body = escape(reason) if reason else (
                 "No trade setup detected right now — the market is unclear for this pair.\n"
-                "Try again in a minute or pick another asset.",
+                "Try again in a minute or pick another asset.")
+            await q.edit_message_text(
+                "🎯 <b>SIGNAL UNAVAILABLE</b>\n\n" + body,
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb([[("🔁 Try again", f"signal:{quote}:{pair}:{label}")],
                                  [("⬅️ Back", f"time:{quote}:{pair}:{label}"),
@@ -268,14 +304,19 @@ async def deliver_signal(context: ContextTypes.DEFAULT_TYPE, q, quote: str,
             return
 
         head = f"💱 {pair} ({label}) - {'BUY' if sig.direction == 'BUY' else 'SELL'}"
-        breakdown = "\n".join(f"   • {r}" for r in sig.reasons)
-        warn = ("\n\n⚠️ " + "\n⚠️ ".join(sig.warnings)) if sig.warnings else ""
+        breakdown = "\n".join(f"   • {escape(r)}" for r in sig.reasons)
+        warn = ("\n\n⚠️ " + "\n⚠️ ".join(escape(w) for w in sig.warnings)) if sig.warnings else ""
+        age = bar_age(df)
+        stale_warn = ""
+        if age is not None and age > DELAY_WARN:
+            stale_warn = (f"\n⚠️ Candle feed is {age / 60:.0f} min old — the broker is "
+                          "sending delayed data. Wait for a fresh bar before entering.")
         text = (
             f"{sig.summary()}\n\n"
             f"<b>{head}</b>\n"
-            f"📊 Regime: {sig.regime}\n"
-            f"🧩 <b>Confluence breakdown:</b>\n{breakdown}{warn}"
-            + (f"\n\n<i>{note}</i>" if note else "")
+            f"📊 Regime: {escape(sig.regime)}\n"
+            f"🧩 <b>Confluence breakdown:</b>\n{breakdown}{warn}{stale_warn}"
+            + (f"\n\n<i>{escape(note)}</i>" if note else "")
         )
         markup = kb([[("🆕 New signal", f"signal:{quote}:{pair}:{label}")],
                      [("⬅️ Select another time", f"asset:{quote}:{pair}")],
@@ -287,7 +328,7 @@ async def deliver_signal(context: ContextTypes.DEFAULT_TYPE, q, quote: str,
         except Exception:
             # HTML rejected (e.g. format error / rate limit) → plain-text retry
             import re
-            plain = re.sub(r"<[^>]+>", "", text + DISCLAIMER)
+            plain = unescape(re.sub(r"<[^>]+>", "", text + DISCLAIMER))
             await q.edit_message_text(plain, reply_markup=markup)
     except Exception as deliver_err:
         log.exception("deliver_signal failed: %s", deliver_err)
@@ -302,7 +343,8 @@ async def deliver_signal(context: ContextTypes.DEFAULT_TYPE, q, quote: str,
 
 
 async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer(f"Page {update.callback_query.data}", show_alert=False)
+    # page indicator button — acknowledge without a nonsense "Page noop:0" toast
+    await update.callback_query.answer()
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -322,7 +364,8 @@ def main():
         from engine.datafeed import has_internet
         ok = await asyncio.to_thread(has_internet)
         log.info("Startup connectivity check: %s",
-                 "LIVE FEED REACHABLE ✅" if ok else "NO INTERNET — synthetic fallbacks will be used ❌")
+                 "LIVE FEED REACHABLE ✅" if ok
+                 else "NO INTERNET — Stock uses a labelled synthetic fallback, OTC will refuse ❌")
 
         from engine import po_feed
         if po_feed.load_ssid():
