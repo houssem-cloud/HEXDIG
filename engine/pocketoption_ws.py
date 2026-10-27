@@ -29,6 +29,17 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("po-ws")
 
+# Header set mirroring the web platform's browser handshake — PO's API rejects
+# connections that don't look like the real client (403 on api-l without these).
+WS_HEADERS = {
+    "Origin": "https://pocketoption.com",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+
 # ----------------------------------------------------------- configuration
 # socket.io websocket endpoints (the web client rotates these; add more as PO changes)
 # Note: dc1-fdyp73x-wss.po.market stopped resolving (NXDOMAIN) — dropped from rotation.
@@ -124,7 +135,7 @@ class POFeed:
             try:
                 log.info("PO feed: connecting %s (demo=%s)", url.split('?')[0], self.demo)
                 async with websockets.connect(url, open_timeout=10,
-                                              additional_headers={"Origin": "https://pocketoption.com"}) as ws:
+                                              additional_headers=WS_HEADERS) as ws:
                     self.endpoint = url
                     # socket.io handshake v4: "40", then authenticate with the ssid frame
                     await ws.send("40")
@@ -150,6 +161,13 @@ class POFeed:
             if isinstance(raw, (bytes, bytearray)):
                 raw = raw.decode("utf-8", "ignore")
             if not isinstance(raw, str) or not raw:
+                return
+
+            if raw.startswith("41"):                    # socket.io server DISCONNECT
+                log.error("PO session REJECTED by server (41) right after auth. "
+                          "Likely causes: ssid expired (log out of the browser kills it), "
+                          "frame truncated in transit, or session bound to another "
+                          "device/IP. Re-capture the ssid and retry.")
                 return
 
             if raw.startswith("2"):                     # socket.io PING -> PONG
