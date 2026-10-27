@@ -1,15 +1,11 @@
 """
-Pocket Option ssid connectivity probe — run this on the AWS server to see exactly
-where the websocket handshake/auth fails:
+Pocket Option ssid probe v2 — handles socket.io binary-event frames.
 
-    sudo /opt/pocketoption-signal-bot/venv/bin/python tools/po_probe.py "42[\"auth\",{...}]"
-        (paste the full ssid frame as the single argument)
-
-It tries every known endpoint, performs the socket.io handshake + auth, prints the
-first raw frames the server sends back, and prints PASS/FAIL per endpoint.
-No engine code is touched — pure diagnostics.
+Run on the AWS server:
+    sudo /opt/pocketoption-signal-bot/venv/bin/python tools/po_probe.py "$(cat /tmp/ssid.txt)"
 """
 import asyncio
+import json
 import sys
 
 sys.path.insert(0, ".")
@@ -17,7 +13,14 @@ sys.path.insert(0, ".")
 from engine.pocketoption_ws import ENDPOINTS, WS_HEADERS, normalize_ssid
 
 
-async def probe(ssid: str, frames_to_show: int = 6):
+def to_text(raw):
+    if isinstance(raw, (bytes, bytearray)):
+        t = raw.decode("utf-8", "ignore")
+        return t, f"BINARY {len(raw)}B: {t[:150]}"
+    return raw, raw[:150]
+
+
+async def probe(ssid: str, frames_to_show: int = 12):
     import websockets
     auth = normalize_ssid(ssid)
     results = []
@@ -30,38 +33,60 @@ async def probe(ssid: str, frames_to_show: int = 6):
                                           additional_headers=WS_HEADERS) as ws:
                 print("  TLS connect ......... OK")
                 await ws.send("40")
-                print("  socket.io handshake . sent 40")
-                got_handshake = False
+                sent_auth = False
+                streamed = 0
+                outcome = None
                 for i in range(frames_to_show):
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=6)
                     except asyncio.TimeoutError:
-                        print(f"  frame {i}: TIMEOUT")
+                        print("  frame: TIMEOUT")
                         break
-                    head = raw if len(raw) <= 160 else raw[:160] + f"  (+{len(raw)} bytes)"
-                    print(f"  frame {i}: {head}")
-                    if raw.startswith(("40", "451")):
-                        got_handshake = True
-                        await ws.send("42" + auth if not auth.startswith("42") else auth)
+                    text, shown = to_text(raw)
+                    print(f"  frame {i}: {shown}")
+
+                    t = text if isinstance(text, str) else str(text)
+                    if isinstance(raw, bytes):
+                        streamed += 1                       # binary payload arrived
+                        continue
+                    if t.startswith("2"):                   # engine.io ping
+                        await ws.send("3")
+                        continue
+                    if t.startswith("41"):
+                        print(f"\n  RESULT {host}: SESSION-REJECTED (41) — ssid expired/"
+                              f"truncated or device/IP-bound")
+                        outcome = "SESSION-REJECTED"
+                        break
+                    if not sent_auth and t.startswith(("0", "40")):
+                        frame = auth if auth.startswith("42") else "42" + auth
+                        await ws.send(frame)
+                        sent_auth = True
                         print("  auth ................ sent")
-                    if '"successauth"' in raw or '"session"' in raw:
-                        print(f"\n  RESULT {host}: PASS — session accepted")
-                        results.append((host, "PASS"))
-                        break
-                    if raw.startswith("41"):
-                        print(f"\n  RESULT {host}: SESSION-REJECTED — server sent socket.io "
-                              f"disconnect (41) after auth: ssid expired/truncated or "
-                              f"bound to another device/IP")
-                        results.append((host, "SESSION-REJECTED"))
-                        break
-                    if "error" in raw.lower() or "can't" in raw.lower():
-                        print(f"\n  RESULT {host}: REJECTED — server error frame above")
-                        results.append((host, "REJECTED"))
-                        break
-                else:
-                    results.append((host, "NO-AUTH-REPLY"))
-                if not got_handshake:
-                    results.append((host, "NO-HANDSHAKE"))
+                        continue
+                    if '"successauth"' in t:
+                        print("  auth confirmed by server")
+                        continue
+                    if '"_placeholder"' in t:
+                        try:
+                            ev = json.loads(t[4:].lstrip("-"))[0] if t.startswith("451-") else "?"
+                        except Exception:
+                            ev = "?"
+                        print(f"  (binary event '{ev}' — REAL payload is the NEXT frame)")
+                        continue
+                    streamed += 1                          # any live text event counts
+
+                if outcome is None:
+                    if sent_auth and streamed >= 1:
+                        outcome = "STREAMING"
+                        print(f"\n  RESULT {host}: PASS — server accepted auth and streamed "
+                              f"{streamed} data frame(s)")
+                    elif sent_auth:
+                        outcome = "CONNECTED-BUT-QUIET"
+                        print(f"\n  RESULT {host}: auth ok but no data frames —")
+                        print("           subscriptions may need a different event name")
+                    else:
+                        outcome = "NO-HANDSHAKE"
+                results.append((host, outcome))
         except Exception as e:
             print(f"  FAIL: {type(e).__name__}: {e}")
             results.append((host, f"FAIL:{type(e).__name__}"))
@@ -70,12 +95,11 @@ async def probe(ssid: str, frames_to_show: int = 6):
     print("SUMMARY")
     for host, r in results:
         print(f"  {host:<28} {r}")
-    print("Interpretation:")
-    print("  FAIL:*  403 on upgrade      -> browser headers missing/blocked (should be")
-    print("                                 gone now; survives only if IP blocked)")
-    print("  SESSION-REJECTED            -> ssid expired/truncated, or device/IP-bound;")
-    print("                                 re-capture from F12 and try the demo ssid")
-    print("  NO-AUTH-REPLY               -> send the frames above for event-name tuning")
+    print("Where to go next:")
+    print("  STREAMING            -> sudo systemctl restart po-bot; then /status")
+    print("  SESSION-REJECTED     -> re-capture ssid from F12, paste it via a file,")
+    print("                          or the session is bound to the capture device/IP")
+    print("  CONNECTED-BUT-QUIET  -> paste the frame list so the tick event can be mapped")
 
 
 if __name__ == "__main__":
