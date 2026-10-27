@@ -31,10 +31,10 @@ log = logging.getLogger("po-ws")
 
 # ----------------------------------------------------------- configuration
 # socket.io websocket endpoints (the web client rotates these; add more as PO changes)
+# Note: dc1-fdyp73x-wss.po.market stopped resolving (NXDOMAIN) — dropped from rotation.
 ENDPOINTS = [
     "wss://api-l.po.market/socket.io/?EIO=4&transport=websocket",
     "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket",
-    "wss://dc1-fdyp73x-wss.po.market/socket.io/?EIO=4&transport=websocket",
 ]
 
 # Engine pair -> Pocket Option asset names (OTC first, fallback spot)
@@ -98,6 +98,7 @@ class POFeed:
         self.last_tick_ts: float | None = None
         self._task: asyncio.Task | None = None
         self._stop = False
+        self._seen_events: set[str] = set()
 
     # ------------------------------------------------------------ lifecycle
     async def run(self):
@@ -134,7 +135,7 @@ class POFeed:
                     for asset in set(a for alts in ASSET_MAP.values() for a in alts):
                         await ws.send('42["subfor","%s"]' % asset)
                     async for raw in ws:
-                        self._handle_frame(raw, ws)
+                        await self._handle_frame(raw, ws)
             except Exception as e:
                 last_err = e
                 log.debug("endpoint failed: %s — %s", url, e)
@@ -143,27 +144,51 @@ class POFeed:
         raise RuntimeError("all PO endpoints failed")
 
     # ------------------------------------------------------------ framing
-    def _handle_frame(self, raw: str, ws):
+    async def _handle_frame(self, raw, ws):
         try:
-            if raw.startswith("2"):                     # socket.io PING
-                asyncio.create_task(ws.send("3"))
+            # PO ships binary engine frames as bytes — normalize to text first
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+            if not isinstance(raw, str) or not raw:
                 return
-            if not raw.startswith("42"):                # 40/451 frames logged for tuning
-                log.debug("PO frame: %.120s", raw)
+
+            if raw.startswith("2"):                     # socket.io PING -> PONG
+                await ws.send("3")
                 return
-            data = json.loads(raw[2:])
-            if not isinstance(data, list) or len(data) < 2:
+            if raw.startswith("451-"):                  # socket.io BINARY event
+                raw = raw[4:].lstrip("-")               # strip the engine prefix
+                log.debug("PO binary frame: %.120s", raw)
+
+            if not raw.startswith("42"):
+                log.debug("PO frame: %.120s", raw)      # 40/metadata frames — logged for tuning
                 return
-            event, payload = data[0], data[1]
-            log.debug("PO event: %s (%.80s)", event, str(payload))
-            if event in ("updateStream", "stream", "updateTick"):
-                self._ingest_ticks(payload)
-            elif event in ("loadHistoryPeriod", "successloadHistoryPeriod"):
-                self._ingest_history(payload)
-            else:
-                log.info("PO event (unmapped, logged for tuning): %s", event)
+
+            try:
+                data = json.loads(raw[2:])
+            except (json.JSONDecodeError, ValueError):
+                log.debug("PO non-json 42 frame: %.120s", raw)
+                return
+
+            # socket.io can batch events: 42[["event",{...}],["event",...]]
+            if data and isinstance(data[0], list):
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 2:
+                        self._dispatch(item[0], item[1])
+            elif isinstance(data, list) and len(data) >= 2 and isinstance(data[0], str):
+                self._dispatch(data[0], data[1])
         except Exception:
-            log.exception("frame parse error: %.120s", raw)
+            # never let one frame kill the session
+            log.exception("frame parse error: %.120s", str(raw)[:120])
+
+    def _dispatch(self, event, payload):
+        if event in ("updateStream", "stream", "updateTick", "updateTickStream"):
+            self._ingest_ticks(payload)
+        elif event in ("loadHistoryPeriod", "successloadHistoryPeriod"):
+            self._ingest_history(payload)
+        elif event not in self._seen_events:
+            self._seen_events.add(event)
+            log.info("PO event (new, logged for tuning): %s  payload~ %.200s",
+                     event, repr(payload)[:200])
 
     # ------------------------------------------------------------ ingestion
     def _ingest_ticks(self, payload):
