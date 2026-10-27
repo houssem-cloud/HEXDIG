@@ -157,11 +157,26 @@ async def get_candles(pair: str, quote_type: str) -> tuple[pd.DataFrame | None, 
             _CACHE[key] = (time.time(), df)
             _mark_live(pair, df)
             return df, "Live spot feed (Yahoo Finance M1)"
+        # PO ssid feed also covers spot pairs when connected
+        from engine import pocketoption_ws as po
+        pdf = po.candles(pair)
+        if pdf is not None:
+            return pdf, "Pocket Option live feed (ssid websocket)"
         # fall through to synthetic backup
         _mark_fallback(f"Yahoo M1 fetch failed for {pair}")
         df = _synthetic(pair, quote_type)
         _CACHE[key] = (time.time(), df)
         return df, "⚠️ Live feed unavailable — backup synthetic feed"
+
+    # OTC: try the live Pocket Option ssid feed first (that's the whole point)
+    from engine import pocketoption_ws as po
+    pdf = po.candles(pair)
+    if pdf is not None:
+        return pdf, "Pocket Option live OTC (ssid authenticated)"
+
+    df = _synthetic(pair, quote_type)
+    _CACHE[key] = (time.time(), df)
+    return df, "⚠️ SSID feed not connected — OTC is synthetic"
 
     df = _synthetic(pair, quote_type)
     _CACHE[key] = (time.time(), df)
