@@ -89,6 +89,35 @@ your local copy should always stay a pure mirror of GitHub.)
 
 If the PAT expires or you rotate it: `sudo git remote set-url origin https://<USER>:<NEW_PAT>@github.com/<USER>/pocketoption-signal-bot.git`
 
+### 6. Live OTC feed (ssid) on the server
+
+The broker feed needs the `BinaryOptionsToolsV2` package (installed by
+`requirements.txt`) and a valid session string:
+
+```bash
+cd /opt/pocketoption-signal-bot
+sudo venv/bin/pip install -r requirements.txt
+sudo venv/bin/python -m engine.po_feed --save '42["auth",{...}]'
+sudo venv/bin/python -m engine.po_feed --show      # assets + EURUSD-OTC payout
+sudo systemctl restart po-bot
+journalctl -u po-bot -f                            # expect: READY — LIVE OTC CANDLES ENABLED
+```
+
+`pocket_ssid.json` is git-ignored (never upload it). `PO_SSID` in `.env` overrides
+the file if both exist. Verify freshness with
+`sudo venv/bin/python -m engine.po_feed --candles EUR/USD` — it prints the last
+bar's age in seconds (a healthy feed stays under ~90 s).
+
+Run the full live check after deploying (it requests every OTC pair, ~4 min):
+
+```bash
+sudo venv/bin/python test_live_check.py
+```
+
+Pocket Option rotates its OTC line-up. A pair that is not currently tradeable is
+**refused** by the bot with an explanation instead of being analysed — that is
+expected, not a bug. Re-run the live check later to see the current list.
+
 ---
 
 ## Route B — scp zip (no GitHub)
@@ -153,6 +182,6 @@ Yahoo Finance). No inbound ports beyond your SSH access.
 | Symptom | Fix |
 |---|---|
 | Clone asks for password, token rejected | PAT missing Contents:Read-only, or wrong repo selected |
-| `journalctl` shows `NO INTERNET — synthetic fallbacks` instantly | `ping -c2 api.telegram.org` — check instance outbound access |
+| `journalctl` shows `NO INTERNET` instantly | `ping -c2 api.telegram.org` — check instance outbound access |
 | Bot never online in Telegram | `grep BOT_TOKEN /opt/pocketoption-signal-bot/.env`; regenerate in BotFather if needed |
 | Fresh start | `sudo systemctl stop po-bot && sudo rm -rf venv && sudo bash deploy/setup.sh` |
