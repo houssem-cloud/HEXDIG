@@ -6,3 +6,4 @@ yfinance>=0.2.54
 pandas>=2.2
 numpy>=1.26
 python-dotenv>=1.0
+websockets>=13.0

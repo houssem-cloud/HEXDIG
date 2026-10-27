@@ -101,6 +101,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = "🟢 Internet reachable" if online else "🔴 No outbound internet — signals fall back to synthetic"
 
+    # Pocket Option ssid websocket state
+    from engine import pocketoption_ws as po
+    ps = po.status()
+    if ps is None:
+        po_line = "⚪ ssid feed not configured — live OTC disabled"
+    elif ps["connected"] and ps["assets_with_bars"]:
+        po_line = (f"🟢 Pocket Option live via ssid — demo={ps['demo']} | ticks={ps['ticks']} | "
+                   f"last tick {ps['tick_age_s']}s ago | {ps['assets_with_bars']} assets streaming")
+    elif ps["connected"]:
+        po_line = "🟡 ssid connected but no candles yet — check the auth frame / subscription settings"
+    else:
+        po_line = "🔴 ssid feed connecting — will retry automatically"
+
     if age is None:
         feed_line = "⚪ No live fetch yet — run a Stock signal once"
     elif age < 120:
@@ -118,12 +131,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🩺 <b>Feed Status</b>\n\n"
         f"🌐 {conn}\n"
         f"📡 {feed_line}\n"
+        f"💹 {po_line}\n"
         + (f"⚠️ Last feed error: <code>{err}</code>\n" if err else "")
         + "\nℹ️ Your Wi-Fi/SSID name is not a data source — the bot reads the internet, "
           "so any connection works.\n\n"
           "📈 <b>Stock pairs</b>: real live 1-min spot candles\n"
-          "🧪 <b>OTC pairs</b>: deterministic synthetic feed (Pocket Option's OTC "
-          "prices are private and can't be read by any tool).",
+          "🧪 <b>OTC pairs</b>: live from Pocket Option when ssid is configured, "
+          "otherwise deterministic synthetic feed.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -311,6 +325,14 @@ def main():
         ok = await asyncio.to_thread(has_internet)
         log.info("Startup connectivity check: %s",
                  "LIVE FEED REACHABLE ✅" if ok else "NO INTERNET — synthetic fallbacks will be used ❌")
+
+        po_ssid = os.getenv("PO_SSID", "").strip()
+        if po_ssid:
+            from engine import pocketoption_ws as po
+            await po.start(po_ssid)
+            log.info("Pocket Option ssid feed: STARTING — LIVE OTC candles enabled ✅")
+        else:
+            log.info("Pocket Option ssid feed: not configured (PO_SSID empty) — OTC stays synthetic")
 
     app = Application.builder().token(BOT_TOKEN).post_init(_boot_check).build()
     app.add_handler(CommandHandler("start", start))
