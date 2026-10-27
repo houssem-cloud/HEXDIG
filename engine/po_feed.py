@@ -402,21 +402,72 @@ def candles(pair: str, otc: bool = True, bars: int = 240) -> pd.DataFrame | None
 
 
 # ------------------------------------------------------------------- payouts
+_PAYOUT_ISSUE = ""          # why the last bulk payout read was empty/failed
+
+
+def _as_pct(val) -> float | None:
+    """92 / 92.0 / "92%" / 0.92 -> 92.0; anything unusable -> None."""
+    try:
+        if isinstance(val, str):
+            val = val.strip().rstrip("%").strip()
+        f = float(val)
+    except Exception:
+        return None
+    if f <= 0:
+        return None
+    # library returns whole percentages (92); tolerate fractions (0.92)
+    return f if f >= 2.0 else f * 100
+
+
 def _normalize_payouts(raw) -> dict[str, float]:
     """Raw library payout payload -> {"EURUSD-OTC": 92.0, ...}."""
     out: dict[str, float] = {}
     if not isinstance(raw, dict):
         return out
     for k, v in raw.items():
-        try:
-            val = v.get("payout", v.get("payment")) if isinstance(v, dict) else v
-            if val is not None and float(val) > 0:
-                f = float(val)
-                # library returns whole percentages (92); tolerate fractions
-                out[str(k).upper().replace("_OTC", "-OTC")] = f if f >= 2.0 else f * 100
-        except Exception:
-            continue
+        if isinstance(v, dict):
+            v = v.get("payout", v.get("payment"))
+        f = _as_pct(v)
+        if f is not None:
+            out[str(k).upper().replace("_OTC", "-OTC")] = f
     return out
+
+
+def _asset_payouts(api) -> dict[str, float]:
+    """
+    Payouts taken from the broker's active-asset list.
+
+    This is the fallback for builds/sessions where `api.payout()` returns an
+    empty map even though the asset list (and therefore the payout field) is
+    loaded - seen on the AWS server. It is still the broker's own number for
+    that exact symbol, never a guess.
+    """
+    try:
+        active = api.active_assets() or []
+    except Exception:
+        return {}
+    if isinstance(active, dict):                 # some builds key by symbol
+        active = list(active.values())
+    return _normalize_payouts({a.get("symbol"): a.get("payout")
+                               for a in active if isinstance(a, dict)})
+
+
+def _bulk_payouts(api) -> dict[str, float]:
+    """`api.payout()` map, or {} (never raises). Records why it was empty."""
+    global _PAYOUT_ISSUE
+    try:
+        raw = api.payout()
+    except Exception as e:
+        _PAYOUT_ISSUE = f"payout() raised {type(e).__name__}: {e}"
+        return {}
+    pay = _normalize_payouts(raw)
+    if not pay:
+        shape = type(raw).__name__
+        size = len(raw) if hasattr(raw, "__len__") else "n/a"
+        _PAYOUT_ISSUE = f"payout() returned {shape} size={size}"
+    else:
+        _PAYOUT_ISSUE = ""
+    return pay
 
 
 def payouts() -> dict[str, float]:
@@ -427,10 +478,12 @@ def payouts() -> dict[str, float]:
             api = _ensure_client()
     if api is None:
         return {}
-    try:
-        return _normalize_payouts(api.payout())
-    except Exception:
-        return {}
+    pay = _bulk_payouts(api)
+    # Fill gaps from the asset list: some library builds return an empty bulk
+    # map while the active assets (loaded at connect) carry the same payouts.
+    for k, v in _asset_payouts(api).items():
+        pay.setdefault(k, v)
+    return pay
 
 
 def payout_for(pair: str, otc: bool = True) -> float | None:
@@ -441,20 +494,54 @@ def payout_for(pair: str, otc: bool = True) -> float | None:
     PocketOption client can take 10+ seconds, and a signal must not wait for a
     cosmetic percentage. Boot-time warm() establishes the client; /status can
     rebuild it when needed.
+
+    Three sources, all the broker's own number for this exact symbol:
+      1. `payout(symbol)` - direct per-asset lookup (cheapest, most precise);
+      2. the bulk `payout()` map;
+      3. the `payout` field of the active-asset list (works on builds where
+         the bulk map comes back empty).
     """
     try:
         api = _CLIENT.get("api")
         if api is None or not _connected(api):
             return None
-        pay = _normalize_payouts(api.payout())
+        global _PAYOUT_ISSUE
+        sym = symbol_for(pair, otc)
         base = pair.replace("/", "").upper()
         key = base + ("-OTC" if otc else "")
-        val = pay.get(key)
-        if val is None and otc:
-            val = pay.get(base)          # some feeds report the spot key
+
+        # 1) direct per-asset lookup
+        try:
+            one = api.payout(sym)
+        except TypeError:
+            one = None                  # older stub without the asset argument
+        except Exception:
+            one = None
+        if one is not None:
+            f = _as_pct(one)
+            if f is not None:
+                _PAYOUT_ISSUE = ""
+                return f
+
+        # 2) bulk map
+        pay = _bulk_payouts(api)
+        val = pay.get(key) or (pay.get(base) if otc else None)
+        if val is not None:
+            return val
+
+        # 3) active-asset list
+        pay = _asset_payouts(api)
+        val = pay.get(key) or (pay.get(base) if otc else None)
+        if val is not None:
+            _PAYOUT_ISSUE = "bulk payout empty; used active-asset payout"
         return val
     except Exception:
         return None
+
+
+def payout_issue() -> str:
+    """Diagnostic for /status: why payouts could not be read ('' if fine)."""
+    return _PAYOUT_ISSUE
 
 
 def symbol_for(pair: str, otc: bool = True) -> str:
@@ -504,7 +591,7 @@ def status() -> dict:
     st = {"library": os.getenv("PO_SSID") and "env" or
           ("file" if os.path.exists(_SSID_FILE) else "none"),
           "connected": False, "assets": 0, "otc_assets": 0,
-          "sample_payout": None, "error": ""}
+          "sample_payout": None, "payout_error": "", "error": ""}
     if not _LOCK.acquire(timeout=30):
         st["error"] = "feed busy (a previous request is still running)"
         return st
@@ -521,6 +608,7 @@ def status() -> dict:
         st["otc_assets"] = sum(1 for a in assets if "otc" in str(a.get("symbol", "")).lower())
         st["connected"] = _connected(api)
         st["sample_payout"] = payout_for("EUR/USD")
+        st["payout_error"] = payout_issue()
         if not st["connected"]:
             st["error"] = "socket disconnected"
     except Exception as e:

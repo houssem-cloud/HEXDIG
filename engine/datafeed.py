@@ -165,12 +165,21 @@ def _synthetic(pair: str, quote_type: str, bars: int = 240) -> pd.DataFrame:
 
 
 def _yahoo(pair: str) -> pd.DataFrame | None:
-    import yfinance as yf
+    import warnings
+
     sym = SYMBOL_MAP.get(pair)
     if not sym:
         return None
     try:
-        df = yf.Ticker(sym).history(period="1d", interval="1m")
+        # yfinance 0.2.x still calls pandas APIs deprecated in pandas 3 (e.g.
+        # inplace on chained objects). Those warnings are library noise: the
+        # returned frame is correct. Scope the filter to this call so our own
+        # deprecations stay visible.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import yfinance as yf
+            df = yf.Ticker(sym).history(period="1d", interval="1m")
         if df is None or df.empty:
             return None
         df = df.rename(columns=str.lower)[["open", "high", "low", "close", "volume"]]
