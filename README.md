@@ -44,13 +44,46 @@ Each component votes Up/Down with a weight; final direction = sum of votes, and 
 🔴 **Accuracy here is a heuristic agreement score — it is NOT a measured win-rate and does
 not guarantee outcomes.** Binary options are high-risk; this tool is for analysis/education.
 
-## Data feeds (`engine/datafeed.py`)
+## Data feeds (`engine/datafeed.py`, `engine/po_feed.py`)
 
+- **OTC pairs** — live Pocket Option prices through the `ssid` session
+  (`engine/po_feed.py`, BinaryOptionsToolsV2), using the broker's own M1 candle
+  series — the same series the Pocket Option chart draws. Bars are fetched with a
+  short-lived client (`get_candles_live()`), which returns the closed history plus
+  the **current forming candle**, so the newest bar is usually 5–60 seconds old.
 - **Stock pairs** — real 1-minute OHLC from Yahoo Finance spot symbols (`EURUSD=X`, …).
-- **OTC pairs** — Pocket Option's OTC feed is private; OTC series is a **deterministic
-  synthetic feed** (seeded per pair per 15-minute bucket, anchored to spot) so every user
-  sees the same candles; signals are reproducible but *not* Pocket Options's live OTC prices.
-- If Yahoo is unreachable, Stock falls back to the synthetic feed and the bot notes this.
+  If Yahoo is empty or stale, the broker's spot feed is tried.
+- **OTC is never faked.** If the broker feed is down, or the pair is currently
+  rotated out of Pocket Option's tradeable list (e.g. EUR/CAD OTC some hours), the
+  bot refuses the signal and explains why. A signal on invented or non-tradeable
+  prices can lose real money, so there is no synthetic OTC fallback.
+- **Freshness is enforced**: a warning appears when the newest bar exceeds 2.5
+  minutes, and a feed older than 15 minutes is refused instead of analysed.
+- **Stock market closed** — the bot says so rather than inventing a signal. The only
+  synthetic series left is the clearly-labelled Stock fallback used when no live
+  source is reachable at all (total network failure).
+- Payout percentages come from the broker and are shown for the requested asset only.
+  OTC assets must be both active and have a payout, otherwise they are refused.
+
+Set the session up once:
+
+```bash
+python -m engine.po_feed --save '42["auth",{...}]'   # or put PO_SSID in .env
+python -m engine.po_feed --show                      # assets + top payouts
+python -m engine.po_feed --candles EUR/USD           # freshness check
+```
+
+## Tests
+
+```bash
+python smoke_test.py          # offline engine smoke test
+python test_data_quality.py   # regression tests for every feed/signal bug found in audit
+python test_po_feed.py        # offline protocol/candle-builder tests
+python test_live_check.py     # live: all 24 pairs, freshness, refusals, latency
+```
+
+`test_live_check.py` needs a valid `pocket_ssid.json` (or `PO_SSID`) and takes a few
+minutes because it requests every OTC pair through the real broker.
 
 ## Files
 
@@ -59,13 +92,15 @@ main.py                 Telegram bot + UI flow + signal formatting
 engine/indicators.py    BB / Stoch / CCI / ADX / ATR / Heikin Ashi / EMA
 engine/patterns.py      Candlestick pattern recognition
 engine/signals.py       Confluence engine -> Higher/Lower + confidence
-engine/datafeed.py      Yahoo spot feed + deterministic OTC generator
+engine/po_feed.py       Pocket Option live feed (ssid) + payouts + tradeability
+engine/datafeed.py      source routing, freshness checks, refusals
 smoke_test.py           Offline test of the engine (no token needed)
 ```
 
 ## Extending
 
 - To rate-limit or gate access, edit `ALLOWED_IDS` / `deliver_signal`.
-- To add pairs, extend `ASSET_PAGES` in `main.py` and `SYMBOL_MAP` in `engine/datafeed.py`.
-- To wire a real Pocket Option account feed later, replace `get_candles` with your own
-  websocket/iframe source; the engine is feed-agnostic.
+- To add pairs, extend `ASSET_PAGES` in `main.py` and `SYMBOL_MAP` in `engine/datafeed.py`
+  (plus `_ASSETS` in `engine/po_feed.py` for the OTC symbol mapping).
+- The engine is feed-agnostic: any source that returns an M1 OHLC DataFrame
+  (`open/high/low/close/volume`, UTC index) plugs into `engine/datafeed.py`.
