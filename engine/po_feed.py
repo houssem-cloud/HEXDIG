@@ -453,7 +453,13 @@ def _asset_payouts(api) -> dict[str, float]:
 
 
 def _bulk_payouts(api) -> dict[str, float]:
-    """`api.payout()` map, or {} (never raises). Records why it was empty."""
+    """
+    `api.payout()` map, or {} (never raises).
+
+    On library 0.2.15 the asset argument is optional; 0.2.16 made it mandatory,
+    so the no-arg call raises TypeError there. That is expected - callers fall
+    back to the per-symbol lookup / active-asset list.
+    """
     global _PAYOUT_ISSUE
     try:
         raw = api.payout()
