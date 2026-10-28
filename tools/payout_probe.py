@@ -63,14 +63,22 @@ def main() -> int:
     t = time.monotonic()
     try:
         raw = api.payout()
-        print(f"payout()   : {time.monotonic() - t:.1f}s type={type(raw).__name__} "
-              f"len={len(raw) if hasattr(raw, '__len__') else 'n/a'}")
-        print("  sample   :", _brief(raw))
-        print("  normalized:", _brief(po_feed._normalize_payouts(raw)))
+    except TypeError as exc:
+        # Library >= 0.2.16 made the asset argument mandatory. That is why the
+        # old bot showed "payout n/a" on this server; the app now uses the
+        # per-asset lookup and the active-asset list below.
+        print(f"payout()   : no-arg form unsupported in "
+              f"{time.monotonic() - t:.1f}s ({exc})")
+        print("             app uses payout(asset) + active-asset list instead")
     except Exception as exc:
         print(f"payout()   : RAISED in {time.monotonic() - t:.1f}s "
               f"{type(exc).__name__}: {exc}")
         traceback.print_exc()
+    else:
+        print(f"payout()   : {time.monotonic() - t:.1f}s type={type(raw).__name__} "
+              f"len={len(raw) if hasattr(raw, '__len__') else 'n/a'}")
+        print("  sample   :", _brief(raw))
+        print("  normalized:", _brief(po_feed._normalize_payouts(raw)))
 
     # 2) per-asset payout
     t = time.monotonic()
