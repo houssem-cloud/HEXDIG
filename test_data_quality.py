@@ -161,6 +161,16 @@ try:
     assert po_feed.payouts().get("EURUSD-OTC") == 83.0
     print("payout: asset-list fallback            OK")
 
+    # Library 0.2.16 made payout(asset) mandatory: payout() raises TypeError.
+    class _NewSignatureAPI(_FakeAPI):
+        def payout(self, asset):                  # no default -> no-arg call raises
+            return self.mapping.get(asset)
+
+    po_feed._CLIENT["api"] = _NewSignatureAPI({}, active)
+    assert po_feed.payout_for("EUR/USD") == 83.0
+    assert po_feed.payouts().get("EURUSD-OTC") == 83.0
+    print("payout: 0.2.16 signature handled       OK")
+
     # Library builds differ in how a percentage is encoded; all mean the same.
     norm = po_feed._normalize_payouts({"EURUSD_otc": "92%", "GBPUSD_otc": 0.88,
                                        "USDJPY_otc": 0, "AUDUSD_otc": None})
